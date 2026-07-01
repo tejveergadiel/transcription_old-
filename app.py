@@ -217,6 +217,24 @@ except ValueError:
 
 VERIFY_SSL_CERTIFICATES = os.getenv('VERIFY_SSL_CERTIFICATES', 'true').lower() in ('true', '1', 'yes')
 
+DATE_FILTER_END = datetime(2025, 12, 31).date()
+
+
+def _is_within_date_filter(last_modified):
+    if last_modified is None:
+        return True
+    if hasattr(last_modified, 'date'):
+        try:
+            return last_modified.date() <= DATE_FILTER_END
+        except Exception:
+            return True
+    try:
+        parsed = datetime.fromisoformat(str(last_modified)).date()
+        return parsed <= DATE_FILTER_END
+    except Exception:
+        return True
+
+
 COS_CLIENT_ERRORS = (ClientError, IBMClientError)
 
 request_gap_lock = Lock()
@@ -1253,6 +1271,7 @@ def get_cos_files(force_refresh=False):
     try:
         logger.info(f"Fetching JSON files from COS bucket {COS_BUCKET}")
         fetched_json_files = []
+        skipped_date_filtered = 0
         continuation_token = None
 
         while True:
@@ -1263,8 +1282,12 @@ def get_cos_files(force_refresh=False):
             response = cos_client.list_objects_v2(**list_kwargs)
             for item in response.get('Contents', []) or []:
                 key = item.get('Key', '')
-                if is_root_bucket_json_key(key):
+                if not is_root_bucket_json_key(key):
+                    continue
+                if _is_within_date_filter(item.get('LastModified')):
                     fetched_json_files.append(key)
+                else:
+                    skipped_date_filtered += 1
 
             if response.get('IsTruncated'):
                 continuation_token = response.get('NextContinuationToken')
@@ -1279,7 +1302,10 @@ def get_cos_files(force_refresh=False):
 
         json_files = fetched_json_files
         json_files_cached_at = time.time()
-        logger.info(f"Found {len(json_files)} root-level JSON files in COS bucket")
+        logger.info(
+            f"Found {len(json_files)} root-level JSON files in COS bucket within date filter <= {DATE_FILTER_END.isoformat()}"
+            + (f" (skipped {skipped_date_filtered} older than cutoff)" if skipped_date_filtered else "")
+        )
         return json_files
     except COS_CLIENT_ERRORS as e:
         json_files = None
