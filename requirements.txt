@@ -1,0 +1,8 @@
+ratelimit
+reportlab
+flask
+requests
+ibm-cos-sdk
+python-dotenv
+gunicorn
+botocore
