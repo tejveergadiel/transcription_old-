@@ -6,7 +6,7 @@ from ibm_botocore.client import Config
 from ibm_botocore.config import Config as BotocoreConfig
 import urllib.parse
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from collections import deque
 from dotenv import load_dotenv
 import logging
@@ -110,6 +110,11 @@ SALESFORCE_API_URL            = os.getenv('SALESFORCE_API_URL')
 PROXY_HOST                    = os.getenv('PROXY_HOST')
 AUDIO_SEARCH_BUCKETS          = os.getenv('AUDIO_SEARCH_BUCKETS', '')
 AUDIO_SEARCH_PREFIXES         = os.getenv('AUDIO_SEARCH_PREFIXES', '')
+
+try:
+    COS_LOOKBACK_HOURS = max(1, int(os.getenv('COS_LOOKBACK_HOURS', '24')))
+except ValueError:
+    COS_LOOKBACK_HOURS = 24
 
 PRESTO_HOSTNAME          = os.getenv('PRESTO_HOSTNAME')
 PRESTO_PORT              = os.getenv('PRESTO_PORT')
@@ -215,25 +220,12 @@ try:
 except ValueError:
     COS_FILE_CACHE_TTL_SECONDS = 300
 
+try:
+    BATCH_PUSH_LIMIT = max(1, int(os.getenv('BATCH_PUSH_LIMIT', '500')))
+except ValueError:
+    BATCH_PUSH_LIMIT = 500
+
 VERIFY_SSL_CERTIFICATES = os.getenv('VERIFY_SSL_CERTIFICATES', 'true').lower() in ('true', '1', 'yes')
-
-DATE_FILTER_END = datetime(2025, 12, 31).date()
-
-
-def _is_within_date_filter(last_modified):
-    if last_modified is None:
-        return True
-    if hasattr(last_modified, 'date'):
-        try:
-            return last_modified.date() <= DATE_FILTER_END
-        except Exception:
-            return True
-    try:
-        parsed = datetime.fromisoformat(str(last_modified)).date()
-        return parsed <= DATE_FILTER_END
-    except Exception:
-        return True
-
 
 COS_CLIENT_ERRORS = (ClientError, IBMClientError)
 
@@ -276,6 +268,12 @@ def _escape_presto_string(value):
         return ''
     # Only escape single quotes and strip newlines — do NOT alter casing
     return str(value).replace("'", "''").replace('\n', ' ').strip()
+
+
+def _escape_soql_string(value):
+    if value is None:
+        return ''
+    return str(value).replace("\\", "\\\\").replace("'", "\\'").replace('\n', ' ').strip()
 
 def _presto_is_configured():
     has_any_catalog = bool(PRESTO_LEAD_CATALOG or PRESTO_OPPORTUNITY_CATALOG or PRESTO_TASK_CATALOG)
@@ -446,6 +444,183 @@ def _query_presto_report(report_type, id_value):
 
 # Valid Salesforce ID pattern: starts with 00Q / 006 / 00T followed by 12-15 alphanumeric chars
 _SF_ID_PATTERN = re.compile(r'^(00Q|006|00T)[a-zA-Z0-9]{12,15}$')
+_SALESFORCE_ID_PATTERN = re.compile(r'^[a-zA-Z0-9]{15}$')
+
+
+def normalize_salesforce_id(value, allowed_prefixes=None):
+    """
+    Normalize a Salesforce ID:
+    - Strip whitespace
+    - Trim 18-character IDs to 15 characters
+    - Validate against the SF ID pattern
+    - Optionally validate against allowed prefixes
+    """
+    sf_id = _normalize_string(value)
+    if not sf_id or not isinstance(sf_id, str):
+        return None
+    # Trim 18-char to 15-char
+    if len(sf_id) == 18:
+        sf_id = sf_id[:15]
+    if not _SF_ID_PATTERN.match(sf_id):
+        return None
+    if allowed_prefixes and not sf_id.startswith(tuple(allowed_prefixes)):
+        return None
+    return sf_id
+
+
+def _first_valid_salesforce_id(values, expected_prefixes):
+    for value in values:
+        sf_id = _normalize_salesforce_id(value, expected_prefixes)
+        if sf_id:
+            return sf_id
+    return None
+
+
+def extract_salesforce_link_ids(data):
+    """
+    Extract Opportunity and Lead IDs from the payload.
+    Returns (opportunity_id, lead_id) tuple.
+    """
+    payload = data or {}
+    
+    # ============================================================
+    # DEBUG LOGGING - Show what we're working with
+    # ============================================================
+    logger.info(f"[LINK EXTRACT] Payload keys: {list(payload.keys())}")
+    logger.info(f"[LINK EXTRACT] lead in payload: {payload.get('lead')}")
+    logger.info(f"[LINK EXTRACT] opportunity in payload: {payload.get('opportunity')}")
+    
+    # ============================================================
+    # DIRECT EXTRACTION from tagged lead/opportunity structures
+    # This is the primary path - if we have tagged data, use it directly
+    # ============================================================
+    
+    opportunity_id = None
+    lead_id = None
+    
+    # Check for tagged lead first (from Presto routing)
+    if isinstance(payload.get('lead'), dict):
+        lead_data = payload['lead']
+        logger.info(f"[LINK EXTRACT] Lead data keys: {list(lead_data.keys())}")
+        lead_tagged_id = lead_data.get('tagged_id')
+        logger.info(f"[LINK EXTRACT] lead_tagged_id: {lead_tagged_id}")
+        
+        if lead_tagged_id:
+            normalized_lead = normalize_salesforce_id(lead_tagged_id, ('00Q',))
+            if normalized_lead:
+                lead_id = normalized_lead
+                logger.info(f"[LINK EXTRACT] ✓ Direct lead tag found: {lead_id}")
+    
+    # Check for tagged opportunity
+    if isinstance(payload.get('opportunity'), dict):
+        opp_data = payload['opportunity']
+        logger.info(f"[LINK EXTRACT] Opportunity data keys: {list(opp_data.keys())}")
+        opp_tagged_id = opp_data.get('tagged_id')
+        logger.info(f"[LINK EXTRACT] opp_tagged_id: {opp_tagged_id}")
+        
+        if opp_tagged_id:
+            normalized_opp = normalize_salesforce_id(opp_tagged_id, ('006',))
+            if normalized_opp:
+                opportunity_id = normalized_opp
+                logger.info(f"[LINK EXTRACT] ✓ Direct opportunity tag found: {opportunity_id}")
+    
+    # If we found both via direct extraction, return them
+    if opportunity_id and lead_id:
+        logger.info(f"[LINK EXTRACT] Found both via direct tags: Opp={opportunity_id}, Lead={lead_id}")
+        return opportunity_id, lead_id
+    
+    # ============================================================
+    # FALLBACK EXTRACTION from various field candidates
+    # Only if we didn't find both IDs via direct extraction
+    # ============================================================
+    
+    # Build candidate lists from various fields
+    opportunity_candidates = [
+        payload.get('Opportunity__c'),
+        payload.get('opportunity__c'),
+        payload.get('OpportunityId'),
+        payload.get('opportunityId'),
+        payload.get('opportunity_id_c'),
+        payload.get('WhatId'),
+        payload.get('whatId'),
+        payload.get('WHATID'),
+    ]
+    
+    lead_candidates = [
+        payload.get('Lead__c'),
+        payload.get('lead__c'),
+        payload.get('LeadId'),
+        payload.get('leadId'),
+        payload.get('WhoId'),
+        payload.get('whoId'),
+        payload.get('WHOID'),
+    ]
+    
+    # Check nested opportunity dict (if not already handled above)
+    if isinstance(payload.get('opportunity'), dict):
+        opportunity_candidates.extend([
+            payload['opportunity'].get('tagged_id'),
+            payload['opportunity'].get('id'),
+            payload['opportunity'].get('opportunity_id_c'),
+            payload['opportunity'].get('WhatId'),
+        ])
+    
+    # Check nested lead dict (if not already handled above)
+    if isinstance(payload.get('lead'), dict):
+        lead_candidates.extend([
+            payload['lead'].get('tagged_id'),
+            payload['lead'].get('id'),
+            payload['lead'].get('WhoId'),
+        ])
+    
+    # Also check UUI field (the original Salesforce ID from the COS JSON)
+    uui_id = _normalize_string(
+        payload.get('UUI') or 
+        payload.get('uui') or 
+        payload.get('Uui') or
+        payload.get('Id') or
+        payload.get('id')
+    )
+    if uui_id:
+        opportunity_candidates.append(uui_id)
+        lead_candidates.append(uui_id)
+    
+    # Try to find a valid opportunity ID (006 prefix) - only if not already found
+    if not opportunity_id:
+        for candidate in opportunity_candidates:
+            normalized = normalize_salesforce_id(candidate, ('006',))
+            if normalized:
+                opportunity_id = normalized
+                logger.info(f"[LINK EXTRACT] Found opportunity ID from fallback: {normalized}")
+                break
+    
+    # Try to find a valid lead ID (00Q prefix) - only if not already found
+    if not lead_id:
+        for candidate in lead_candidates:
+            normalized = normalize_salesforce_id(candidate, ('00Q',))
+            if normalized:
+                lead_id = normalized
+                logger.info(f"[LINK EXTRACT] Found lead ID from fallback: {normalized}")
+                break
+    
+    # ============================================================
+    # FINAL VERIFICATION - Ensure we have at least one valid ID
+    # ============================================================
+    
+    logger.info(f"[LINK EXTRACT] Final result - opportunity_id: {opportunity_id}, lead_id: {lead_id}")
+    
+    # If we have both, log the relationship
+    if opportunity_id and lead_id:
+        logger.info(f"[LINK EXTRACT] Both Opportunity ({opportunity_id}) and Lead ({lead_id}) found")
+    elif opportunity_id:
+        logger.info(f"[LINK EXTRACT] Only Opportunity found: {opportunity_id}")
+    elif lead_id:
+        logger.info(f"[LINK EXTRACT] Only Lead found: {lead_id}")
+    else:
+        logger.warning("[LINK EXTRACT] No valid Opportunity or Lead ID found")
+        logger.warning(f"[LINK EXTRACT] All candidates - Opp: {opportunity_candidates}, Lead: {lead_candidates}")
+    
+    return opportunity_id, lead_id
 
 def extract_uui_from_payload(json_data):
     """
@@ -464,8 +639,9 @@ def extract_uui_from_payload(json_data):
 
     candidate_keys = [
         'UUI', 'uui', 'Uui',
-        'id', 'opportunity_id_c',
-        'activity_id_c', 'WhoId', 'WhatId',
+        'Opportunity__c', 'opportunity__c', 'opportunity_id_c', 'OpportunityId', 'opportunityId',
+        'Lead__c', 'lead__c', 'activity_id_c', 'WhoId', 'WhatId',
+        'Id', 'id', 'SalesforceId', 'salesforceId', 'salesforce_id',
     ]
 
     for key in candidate_keys:
@@ -895,6 +1071,7 @@ json_files_cached_at   = 0.0
 PAUSE_PROCESSING       = False
 CANCEL_PROCESSING      = False
 BATCH_PROCESSING_COMPLETED = False
+BATCH_PUSH_LIMIT_REACHED   = False
 STATE_FILE             = 'batch_state.json'
 state_file_lock        = Lock()
 push_dedupe_lock       = Lock()
@@ -1053,13 +1230,14 @@ def _check_batch_pause(file_key=None, stage=None):
 
 
 def _start_batch_thread(max_workers=4, batch_size=100):
-    global batch_thread, PAUSE_PROCESSING, CANCEL_PROCESSING, BATCH_PROCESSING_COMPLETED
+    global batch_thread, PAUSE_PROCESSING, CANCEL_PROCESSING, BATCH_PROCESSING_COMPLETED, BATCH_PUSH_LIMIT_REACHED
     with batch_state_lock:
         if batch_thread and batch_thread.is_alive():
             return False
         PAUSE_PROCESSING = False
         CANCEL_PROCESSING = False
         BATCH_PROCESSING_COMPLETED = False
+        BATCH_PUSH_LIMIT_REACHED = False
         batch_thread = Thread(
             target=process_and_push_all_jsons,
             kwargs={'max_workers': max_workers, 'batch_size': batch_size},
@@ -1244,6 +1422,12 @@ def is_file_key_in_current_window(file_key):
     return file_key in set(get_cos_files(force_refresh=True))
 
 
+def get_current_month_window():
+    window_start = datetime(2020, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 6, 30, 23, 59, 59, tzinfo=timezone.utc)
+    return window_start, window_end
+
+
 def is_root_bucket_json_key(key):
     normalized_key = str(key or '').strip()
     return (
@@ -1252,6 +1436,21 @@ def is_root_bucket_json_key(key):
         and '/' not in normalized_key
         and '\\' not in normalized_key
     )
+
+
+def is_cos_item_in_current_window(item):
+    last_modified = item.get('LastModified') if isinstance(item, dict) else None
+    if not last_modified:
+        logger.warning(f"[COS WINDOW] Skipping {item.get('Key') if isinstance(item, dict) else 'unknown'}; missing LastModified")
+        return False
+
+    if last_modified.tzinfo is None:
+        last_modified = last_modified.replace(tzinfo=timezone.utc)
+    else:
+        last_modified = last_modified.astimezone(timezone.utc)
+
+    window_start, now = get_current_month_window()
+    return window_start <= last_modified <= now
 
 
 # ============================================================
@@ -1270,8 +1469,7 @@ def get_cos_files(force_refresh=False):
         return json_files
     try:
         logger.info(f"Fetching JSON files from COS bucket {COS_BUCKET}")
-        fetched_json_files = []
-        skipped_date_filtered = 0
+        fetched_json_items = []
         continuation_token = None
 
         while True:
@@ -1282,12 +1480,8 @@ def get_cos_files(force_refresh=False):
             response = cos_client.list_objects_v2(**list_kwargs)
             for item in response.get('Contents', []) or []:
                 key = item.get('Key', '')
-                if not is_root_bucket_json_key(key):
-                    continue
-                if _is_within_date_filter(item.get('LastModified')):
-                    fetched_json_files.append(key)
-                else:
-                    skipped_date_filtered += 1
+                if is_root_bucket_json_key(key) and is_cos_item_in_current_window(item):
+                    fetched_json_items.append(item)
 
             if response.get('IsTruncated'):
                 continuation_token = response.get('NextContinuationToken')
@@ -1296,16 +1490,18 @@ def get_cos_files(force_refresh=False):
             else:
                 break
 
-        if not fetched_json_files:
-            logger.warning("No root-level JSON objects found in COS bucket")
+        window_start, now = get_current_month_window()
+        window_label = f"{window_start.date().isoformat()} to {now.date().isoformat()}"
+
+        if not fetched_json_items:
+            logger.warning(f"No root-level JSON objects found in COS bucket for {window_label}")
             return []
 
+        fetched_json_items.sort(key=lambda item: item.get('LastModified') or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        fetched_json_files = [item.get('Key') for item in fetched_json_items if item.get('Key')]
         json_files = fetched_json_files
         json_files_cached_at = time.time()
-        logger.info(
-            f"Found {len(json_files)} root-level JSON files in COS bucket within date filter <= {DATE_FILTER_END.isoformat()}"
-            + (f" (skipped {skipped_date_filtered} older than cutoff)" if skipped_date_filtered else "")
-        )
+        logger.info(f"Found {len(json_files)} root-level JSON files in COS bucket for {window_label}")
         return json_files
     except COS_CLIENT_ERRORS as e:
         json_files = None
@@ -1350,27 +1546,18 @@ def parse_call_duration(duration_str):
 
 def get_monitor_ucid(json_data):
     data = json_data or {}
-    return data.get('monitor_ucid') or data.get('monitorUCID') or data.get('MonitorUCID') or 'Unknown'
+    return (
+        data.get('monitor_ucid')
+        or data.get('monitorUCID')
+        or data.get('monitorUcid__c')
+        or data.get('MonitorUCID')
+        or 'Unknown'
+    )
 
 
 def get_uui(json_data):
     """Extract UUI from COS JSON payload — trimmed to 15 chars if 18-char ID."""
-    data = json_data or {}
-    uui = (data.get('UUI') or
-           data.get('uui') or
-           data.get('Uui') or
-           data.get('Id') or
-           data.get('id') or
-           data.get('SalesforceId') or
-           data.get('salesforceId') or
-           'Unknown')
-    if isinstance(uui, str):
-        uui = uui.strip()
-        # Trim 18-character Salesforce ID to 15 characters (remove last 3 chars)
-        if len(uui) == 18:
-            uui = uui[:15]
-        return uui
-    return 'Unknown'
+    return extract_uui_from_payload(json_data) or 'Unknown'
 
 
 def _parse_csv_values(value):
@@ -1735,6 +1922,10 @@ def clean_transcript_lines(transcript):
         line = _normalize_transcript_line(raw_line)
         if not line:
             continue
+        line = re.sub(r'\b(?:Agent|Customer|Speaker1|Speaker2):(?=\s*(?:Agent|Customer|Speaker1|Speaker2):|$)', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+', ' ', line).strip()
+        if not line:
+            continue
         speaker_match = re.match(r'^(Agent|Customer|Speaker1|Speaker2):\s*(.*)$', line, re.IGNORECASE)
         if speaker_match:
             flush_current()
@@ -1892,23 +2083,72 @@ def parse_call_quality(callquality):
     if not isinstance(callquality, str):
         return parsed
 
+    # Check if it's all in one line and split by markers
+    text = callquality.strip()
+    markers = [
+        "Add-on Request by Customer:",
+        "Action Taken for the request:", 
+        "Call Rating:",
+        "Reason:"
+    ]
+    # First check if we have any markers
+    has_markers = any(marker in text for marker in markers)
     reasons = []
-    for raw_line in callquality.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("Add-on Request by Customer:"):
-            parsed["request"] = line[len("Add-on Request by Customer:"):].strip() or parsed["request"]
-        elif line.startswith("Action Taken for the request:"):
-            parsed["action"] = line[len("Action Taken for the request:"):].strip() or parsed["action"]
-        elif line.startswith("Call Rating:"):
-            parsed["rating"] = normalize_rating_value(line[len("Call Rating:"):].strip())
-        elif line.startswith("Reason:"):
-            reason = line[len("Reason:"):].strip()
-            if reason and reason not in reasons:
-                reasons.append(reason)
-    if reasons:
-        parsed["reasons"] = reasons
+    if has_markers:
+        # Use string find to get all markers and their values
+        parts = []
+        marker_positions = []
+        for marker in markers:
+            idx = 0
+            while True:
+                pos = text.find(marker, idx)
+                if pos == -1:
+                    break
+                marker_positions.append((pos, marker))
+                idx = pos + len(marker)
+        # Sort marker positions by their index
+        marker_positions.sort(key=lambda x: x[0])
+        # Now extract values between markers
+        for i in range(len(marker_positions)):
+            pos, marker = marker_positions[i]
+            start = pos + len(marker)
+            if i < len(marker_positions) - 1:
+                end = marker_positions[i+1][0]
+                value = text[start:end].strip()
+            else:
+                value = text[start:].strip()
+            parts.append((marker, value))
+        # Now process each part
+        for marker, value in parts:
+            if marker == "Add-on Request by Customer:":
+                parsed["request"] = value or parsed["request"]
+            elif marker == "Action Taken for the request:":
+                parsed["action"] = value or parsed["action"]
+            elif marker == "Call Rating:":
+                parsed["rating"] = normalize_rating_value(value)
+            elif marker == "Reason:":
+                if value and value not in reasons:
+                    reasons.append(value)
+        if reasons:
+            parsed["reasons"] = reasons
+    else:
+        # Try splitting by lines first
+        for raw_line in callquality.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("Add-on Request by Customer:"):
+                parsed["request"] = line[len("Add-on Request by Customer:"):].strip() or parsed["request"]
+            elif line.startswith("Action Taken for the request:"):
+                parsed["action"] = line[len("Action Taken for the request:"):].strip() or parsed["action"]
+            elif line.startswith("Call Rating:"):
+                parsed["rating"] = normalize_rating_value(line[len("Call Rating:"):].strip())
+            elif line.startswith("Reason:"):
+                reason = line[len("Reason:"):].strip()
+                if reason and reason not in reasons:
+                    reasons.append(reason)
+        if reasons:
+            parsed["reasons"] = reasons
     return parsed
 
 
@@ -2052,6 +2292,65 @@ def ensure_list(value, fallback):
     return list(fallback)
 
 
+def normalize_customer_details(customer_details):
+    details = dict(customer_details or {})
+    normalized = {
+        "caller_tone": details.get("caller_tone") or "Unknown",
+        "customer_tone": details.get("customer_tone") or "Unknown",
+        "intent": details.get("intent") or "Unknown",
+        "urgency": details.get("urgency") or "Unknown"
+    }
+
+    # Keep backwards-compatible aliases for downstream consumers.
+    normalized["caller_tone_emotion"] = normalized["caller_tone"]
+    normalized["customer_tone_emotion"] = normalized["customer_tone"]
+    return normalized
+
+
+def build_analysis_payload(
+    file_key,
+    transcript,
+    insights,
+    callquality,
+    separated,
+    customer_details,
+    call_to_action=None,
+    json_data=None,
+    source="app"
+):
+    try:
+        insight_summary, sentiment = insights
+    except (TypeError, ValueError):
+        insight_summary = "Error: Could not extract summary"
+        sentiment = "Error: Could not extract sentiment"
+
+    json_data = json_data or {}
+    monitor_ucid = get_monitor_ucid(json_data)
+
+    transcript_text = normalize_transcript_payload(transcript)
+    separated_source = separated if separated else transcript_text
+    separated_text = format_transcript_for_storage(separated_source)
+
+    payload = {
+        "monitorUCID": monitor_ucid,
+        "call_transcription": {
+            "raw_transcript": transcript_text,
+            "separated_transcript": separated_text
+        },
+        "call_insight": {
+            "summary": insight_summary
+        },
+        "call_rating": {
+            "quality": callquality
+        },
+        "call_sentiment_analysis": {
+            "sentiment": sentiment
+        }
+    }
+
+    return payload
+
+
 # ============================================================
 # TRANSCRIPT CHUNKING
 # ============================================================
@@ -2059,10 +2358,27 @@ def ensure_list(value, fallback):
 def validate_enriched_payload(data, file_key):
     """Check if payload has required enrichment fields before pushing.
     Works with NORMALIZED Salesforce field names."""
+    # The core required fields (the rest are optional)
     required_fields = ['Transcript__c', 'Separated_Transcript__c', 'Call_Insight__c', 'Sentiment__c', 'call_Rating__c']
     logger.debug(f"[VALIDATION CHECK] {file_key} payload keys: {list(data.keys()) if data else 'None'}")
 
+    # Normalize rating field casing: older saved JSON files may have
+    # 'Call_Rating__c' (capital C) instead of 'call_Rating__c'.
+    if not data.get('call_Rating__c') and data.get('Call_Rating__c'):
+        data['call_Rating__c'] = data['Call_Rating__c']
+
     missing = [f for f in required_fields if not data.get(f)]
+
+    # Check for lead or opportunity
+    has_lead_or_opp = (
+        (data.get('lead') and isinstance(data.get('lead'), dict) and data.get('lead').get('tagged_id'))
+        or (data.get('Lead__c'))
+        or (data.get('opportunity') and isinstance(data.get('opportunity'), dict) and data.get('opportunity').get('tagged_id'))
+        or (data.get('Opportunity__c'))
+    )
+    if not has_lead_or_opp:
+        logger.error(f"[VALIDATION FAILED] {file_key} missing lead or opportunity tagging")
+        missing.append('lead/opportunity')
 
     if missing:
         logger.error(f"[VALIDATION FAILED] {file_key} missing fields: {missing}")
@@ -2110,97 +2426,652 @@ def chunk_transcript(transcript_text, turns_per_chunk=4):
     return chunks
 
 
+def collapse_repeated_block(text, min_block_len=40):
+    """
+    Detect a block of text that repeats consecutively 3+ times near the
+    end of the transcript (a degenerate LLM loop) and collapse it down
+    to a single occurrence.
+    """
+    n = len(text)
+    if n < min_block_len * 3:
+        return text
+
+    tail_len = min(n, 4000)
+    tail = text[-tail_len:]
+    tail_start_in_text = n - tail_len
+
+    best_cut = None
+    for period in range(min_block_len, tail_len // 3 + 1):
+        block = tail[-period:]
+        reps = 1
+        pos = tail_len - period
+        while pos - period >= 0 and tail[pos - period:pos] == block:
+            reps += 1
+            pos -= period
+        if reps >= 3:
+            cut = tail_start_in_text + pos + period  # keep ONE copy of block
+            if best_cut is None or cut < best_cut:
+                best_cut = cut
+
+    if best_cut is None:
+        return text
+
+    truncated = text[:best_cut].rstrip()
+    return truncated if truncated else text
+
+
+def truncate_self_repetition(text, min_anchor_len=60):
+    """
+    Detect runaway LLM repetition/restart loops in transcript text:
+
+    1. A stray mid-text code-fence marker (```python etc.) signals the
+       model restarted generation from scratch — truncate there.
+    2. A verbatim repeat of the opening of the text signals a full
+       transcript restart — truncate at the second occurrence.
+    3. A short block repeating 3+ times consecutively near the end
+       signals a degenerate loop — collapse to a single occurrence.
+    """
+    if not isinstance(text, str) or len(text) < min_anchor_len:
+        return text
+
+    fence_match = re.search(r'```(?:python|json|text)?', text, flags=re.IGNORECASE)
+    if fence_match and fence_match.start() > min_anchor_len:
+        truncated = text[:fence_match.start()].rstrip()
+        for boundary in ('\n', '. '):
+            idx = truncated.rfind(boundary)
+            if idx != -1 and idx > len(truncated) * 0.3:
+                truncated = truncated[:idx + len(boundary)].rstrip()
+                break
+        return truncated if truncated else text
+
+    if len(text) >= min_anchor_len * 2:
+        anchor = text[:min_anchor_len]
+        second_occurrence = text.find(anchor, min_anchor_len)
+        if second_occurrence != -1:
+            truncated = text[:second_occurrence].rstrip()
+            for boundary in ('\n', '. '):
+                idx = truncated.rfind(boundary)
+                if idx != -1 and idx > len(truncated) * 0.5:
+                    truncated = truncated[:idx + len(boundary)].rstrip()
+                    break
+            if truncated:
+                text = truncated
+
+    text = collapse_repeated_block(text)
+
+    return text
+
+
+def clean_salesforce_text_value(value):
+    if not isinstance(value, str):
+        return value
+    text = value.replace('\x00', '').strip()
+    text = re.sub(r'\n?\s*```(?:python|json|text)?\s*$', '', text, flags=re.IGNORECASE).strip()
+    text = truncate_self_repetition(text)
+    return text
+
+
+NO_TRANSCRIPT_PLACEHOLDER = "No transcription available"
+MISSING_AUDIO_TRANSCRIPT = "No audio URL is available"
+MISSING_AUDIO_REASON = "Not processed due to missing URL"
+
+
+def normalize_rating_value(rating_text):
+    """Extract and normalize the rating value from text like 'X.X out of 10'"""
+    if not rating_text or rating_text == "Unknown":
+        return "Unknown"
+    
+    # Handle format like "8.5 out of 10"
+    if "out of 10" in rating_text:
+        try:
+            rating_str = rating_text.split("out of 10")[0].strip()
+            rating_value = float(rating_str)
+            # Validate rating is between 0 and 10
+            if 0 <= rating_value <= 10:
+                return f"{rating_value:g}/10"
+        except (ValueError, IndexError):
+            pass
+    
+    # Handle format like "8.5/10"
+    if "/" in rating_text:
+        try:
+            parts = rating_text.split("/")
+            if len(parts) == 2:
+                rating_value = float(parts[0])
+                denominator = parts[1].strip()
+                if denominator == "10" and 0 <= rating_value <= 10:
+                    return f"{rating_value:g}/10"
+        except ValueError:
+            pass
+    
+    # If we can't parse, return as-is
+    return str(rating_text).strip()
+
+
+def parse_call_quality(callquality):
+    parsed = {
+        "request": "No specific customer request identified",
+        "action": "No specific agent action identified",
+        "rating": "Unknown",
+        "reasons": []
+    }
+
+    if isinstance(callquality, dict) and callquality.get("short_call"):
+        parsed["request"] = "No specific customer request identified"
+        parsed["action"] = "No specific agent action identified"
+        parsed["rating"] = "Short call"
+        parsed["reasons"] = ["Call duration was 15 seconds or shorter."]
+        return parsed
+
+    if isinstance(callquality, dict):
+        parsed["request"] = callquality.get("request") or parsed["request"]
+        parsed["action"] = callquality.get("action") or parsed["action"]
+        rating = callquality.get("rating")
+        if rating:
+            parsed["rating"] = normalize_rating_value(rating)
+        parsed["reasons"] = ensure_list(callquality.get("reasons"), [])
+    elif isinstance(callquality, str):
+        # First try parsing structured lines like "Add-on Request by Customer:", "Call Rating:", etc.
+        reasons = []
+        # Check if it's all in one line and split by markers
+        text = callquality.strip()
+        markers = [
+            "Add-on Request by Customer:",
+            "Action Taken for the request:", 
+            "Call Rating:",
+            "Reason:"
+        ]
+        # Create a regex to split on any of these markers
+        import re
+        pattern = '|'.join(re.escape(marker) for marker in markers)
+        # Split the text, then process each segment with its marker
+        # First check if we have any markers
+        has_markers = any(marker in text for marker in markers)
+        if has_markers:
+            # Use regex to find all markers and their values
+            # Let's build a list of (marker, value) pairs
+            parts = []
+            # First, find all positions of markers
+            marker_positions = []
+            for marker in markers:
+                idx = 0
+                while True:
+                    pos = text.find(marker, idx)
+                    if pos == -1:
+                        break
+                    marker_positions.append((pos, marker))
+                    idx = pos + len(marker)
+            # Sort marker positions by their index
+            marker_positions.sort(key=lambda x: x[0])
+            # Now extract values between markers
+            for i in range(len(marker_positions)):
+                pos, marker = marker_positions[i]
+                start = pos + len(marker)
+                if i < len(marker_positions) - 1:
+                    end = marker_positions[i+1][0]
+                    value = text[start:end].strip()
+                else:
+                    value = text[start:].strip()
+                parts.append((marker, value))
+            # Now process each part
+            for marker, value in parts:
+                if marker == "Add-on Request by Customer:":
+                    parsed["request"] = value or parsed["request"]
+                elif marker == "Action Taken for the request:":
+                    parsed["action"] = value or parsed["action"]
+                elif marker == "Call Rating:":
+                    parsed["rating"] = normalize_rating_value(value)
+                elif marker == "Reason:":
+                    if value and value not in reasons:
+                        reasons.append(value)
+            if reasons:
+                parsed["reasons"] = reasons
+        else:
+            # Try splitting by lines first
+            for raw_line in callquality.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("Add-on Request by Customer:"):
+                    parsed["request"] = line[len("Add-on Request by Customer:"):].strip() or parsed["request"]
+                elif line.startswith("Action Taken for the request:"):
+                    parsed["action"] = line[len("Action Taken for the request:"):].strip() or parsed["action"]
+                elif line.startswith("Call Rating:"):
+                    parsed["rating"] = normalize_rating_value(line[len("Call Rating:"):].strip())
+                elif line.startswith("Reason:"):
+                    reason = line[len("Reason:"):].strip()
+                    if reason and reason not in reasons:
+                        reasons.append(reason)
+            if reasons:
+                parsed["reasons"] = reasons
+            else:
+                # If no structured lines found, try just using it as a rating
+                parsed_rating = normalize_rating_value(callquality)
+                if parsed_rating != "Unknown":
+                    parsed["rating"] = parsed_rating
+    return parsed
+
+
+def migrate_legacy_output_schema(payload):
+    """
+    Convert legacy output JSON shape to the current schema in-place-compatible form.
+    Currently:
+    - call_transcription: "<text>"  ->  call_transcription.separated_transcript
+    Returns: (migrated_payload, changed)
+    """
+    data = dict(payload or {})
+    changed = False
+
+    call_transcription = data.get("call_transcription")
+    if isinstance(call_transcription, str):
+        data["call_transcription"] = {"separated_transcript": call_transcription}
+        changed = True
+    elif call_transcription is None:
+        data["call_transcription"] = {"separated_transcript": NO_TRANSCRIPT_PLACEHOLDER}
+        changed = True
+
+    return data, changed
+
+
 # ============================================================
 # SALESFORCE PAYLOAD HELPERS
 # ============================================================
 
 def normalize_salesforce_payload(data):
+    """Upgrade legacy payload shapes to the nested structure Salesforce expects."""
     payload = dict(data or {})
-    normalized = {}
+    monitor_ucid = payload.get("monitorUCID") or payload.get("monitorUcid") or payload.get("monitor_ucid")
 
-    # ── Exact list of fields you want ────────────────────────────
-
-    # 1. monitorUcid__c
-    if "monitorUCID" in payload:
-        normalized["monitorUcid__c"] = payload["monitorUCID"]
-
-    # 2. Separated_Transcript__c and Transcript__c
     transcript_value = payload.get("call_transcription")
-    if transcript_value:
-        if isinstance(transcript_value, str):
-            normalized["Transcript__c"] = transcript_value
-            normalized["Separated_Transcript__c"] = chunk_transcript(transcript_value)
-        elif isinstance(transcript_value, dict):
-            raw = transcript_value.get("raw_transcript") or transcript_value.get("rawTranscript")
-            sep = (
-                transcript_value.get("separated_transcript")
-                or transcript_value.get("separatedTranscript")
-                or raw
+    if isinstance(transcript_value, str):
+        payload["call_transcription"] = {
+            "separated_transcript": transcript_value
+        }
+    elif transcript_value is None:
+        payload["call_transcription"] = {
+            "separated_transcript": "No transcription available"
+        }
+    elif isinstance(transcript_value, dict):
+        raw_transcript = transcript_value.get("raw_transcript") or transcript_value.get("rawTranscript")
+        separated_transcript = (
+            transcript_value.get("separated_transcript")
+            or transcript_value.get("separatedTranscript")
+            or raw_transcript
+        )
+        payload["call_transcription"] = {
+            "separated_transcript": separated_transcript or raw_transcript or "No transcription available"
+        }
+
+    # Check both lowercase call_rating and capital call_Rating
+    rating_value = payload.get("call_rating") or payload.get("call_Rating")
+    if isinstance(rating_value, str):
+        parsed_rating = parse_call_quality(rating_value)
+        payload["call_rating"] = {
+            "rating": parsed_rating.get("rating", "Unknown"),
+            "reasons": ensure_list(parsed_rating.get("reasons"), ["No specific reason provided"])
+        }
+    elif isinstance(rating_value, dict):
+        # Check if rating field is a string that needs parsing
+        rating_str = rating_value.get("rating")
+        if isinstance(rating_str, str) and any(marker in rating_str for marker in ["Add-on Request by Customer:", "Call Rating:", "Action Taken for the request:", "Reason:"]):
+            # Parse the string with parse_call_quality
+            parsed_rating = parse_call_quality(rating_str)
+            payload["call_rating"] = {
+                "rating": parsed_rating.get("rating", "Unknown"),
+                "reasons": ensure_list(parsed_rating.get("reasons"), ["No specific reason provided"])
+            }
+        elif "quality" in rating_value and ("rating" not in rating_value or "reasons" not in rating_value):
+            parsed_rating = parse_call_quality(rating_value.get("quality"))
+            payload["call_rating"] = {
+                "rating": parsed_rating.get("rating", "Unknown"),
+                "reasons": ensure_list(parsed_rating.get("reasons"), ["No specific reason provided"])
+            }
+        else:
+            payload["call_rating"] = {
+                "rating": normalize_rating_value(rating_value.get("rating")),
+                "reasons": ensure_list(rating_value.get("reasons"), ["No specific reason provided"])
+            }
+
+    if "call_to_action" in payload:
+        payload["call_to_action"] = ensure_list(payload.get("call_to_action"), [])
+
+    # Populate Salesforce field aliases expected by the object schema.
+    transcript_text = str(payload.get("call_transcription", {}).get("separated_transcript") or "No transcription available")
+    transcript_text = transcript_text
+    payload["call_transcription"]["separated_transcript"] = transcript_text
+
+    if monitor_ucid and not payload.get("monitorUcid__c"):
+        payload["monitorUcid__c"] = str(monitor_ucid).strip()
+
+    if transcript_text and not payload.get("Separated_Transcript__c"):
+        payload["Separated_Transcript__c"] = transcript_text
+
+    call_insight = payload.get("call_insight")
+    if isinstance(call_insight, dict):
+        summary_text = str(call_insight.get("summary") or "").strip()
+        if summary_text and not payload.get("Call_Insight__c"):
+            payload["Call_Insight__c"] = summary_text
+
+    sentiment_block = payload.get("call_sentiment_analysis")
+    if isinstance(sentiment_block, dict):
+        sentiment_text = str(sentiment_block.get("sentiment") or "").strip()
+        if sentiment_text and not payload.get("Sentiment__c"):
+            payload["Sentiment__c"] = sentiment_text
+
+    logger.info(f"[normalize_salesforce_payload] Looking for rating_block, call_rating exists: {bool(payload.get('call_rating'))}, call_Rating exists: {bool(payload.get('call_Rating'))}")
+    rating_block = payload.get("call_rating") or payload.get("call_Rating")
+    logger.info(f"[normalize_salesforce_payload] rating_block type: {type(rating_block)}, value: {repr(rating_block)}")
+    if isinstance(rating_block, dict):
+        rating_value = rating_block.get("quality") or rating_block.get("rating")
+        rating_text = normalize_rating_value(rating_value)
+        logger.info(f"[normalize_salesforce_payload] rating_value: {repr(rating_value)}")
+        reasons = ensure_list(rating_block.get("reasons"), [])
+        logger.info(f"[normalize_salesforce_payload] rating_text: {repr(rating_text)}, reasons: {reasons}")
+        if reasons:
+            rating_parts = [f"Call Rating: {rating_text}"]
+            rating_parts.extend([f"Reason {i + 1}: {reason}" for i, reason in enumerate(reasons)])
+            final_rating_text = " | ".join(rating_parts)
+        else:
+            final_rating_text = f"Call Rating: {rating_text}"
+        logger.info(f"[normalize_salesforce_payload] final_rating_text: {repr(final_rating_text)}")
+        if rating_text and not payload.get("call_Rating__c"):
+            payload["call_Rating__c"] = clean_salesforce_text_value(final_rating_text)
+            logger.info(f"[normalize_salesforce_payload] Set call_Rating__c to: {repr(payload.get('call_Rating__c'))}")
+            # Also set the other variations for compatibility
+            if not payload.get("Call_Rating__c"):
+                payload["Call_Rating__c"] = payload["call_Rating__c"]
+            if not payload.get("call_rating__c"):
+                payload["call_rating__c"] = payload["call_Rating__c"]
+
+    # Handle Opportunity__c
+    opportunity_id = (
+        payload.get("Opportunity__c")
+        or payload.get("opportunity__c")
+        or payload.get("OpportunityId")
+        or payload.get("opportunityId")
+        or payload.get("opportunity_id_c")
+    )
+    if not opportunity_id and isinstance(payload.get("opportunity"), dict):
+        opportunity_id = (
+            payload["opportunity"].get("tagged_id")
+            or payload["opportunity"].get("opportunity_id_c")
+            or payload["opportunity"].get("id")
+        )
+    if opportunity_id and str(opportunity_id).startswith("006"):
+        payload["Opportunity__c"] = opportunity_id
+
+    # Handle Lead__c
+    lead_id = (
+        payload.get("Lead__c")
+        or payload.get("lead__c")
+        or payload.get("LeadId")
+        or payload.get("leadId")
+        or payload.get("WhoId")
+    )
+    if not lead_id and isinstance(payload.get("lead"), dict):
+        lead_id = (
+            payload["lead"].get("tagged_id")
+            or payload["lead"].get("id")
+            or payload["lead"].get("WhoId")
+        )
+    if lead_id and str(lead_id).startswith("00Q"):
+        payload["Lead__c"] = lead_id
+
+    return payload
+
+
+SALESFORCE_OUTPUT_FIELDS = [
+    'monitorUcid__c',
+    'Transcript__c',
+    'Separated_Transcript__c',
+    'Call_Insight__c',
+    'Sentiment__c',
+    'call_Rating__c',
+    'Opportunity__c',
+    'Lead__c'
+]
+
+
+def compact_salesforce_output_payload(data):
+    """Keep only required fields as nested structure for Salesforce push."""
+    input_data = dict(data or {})
+    payload = {}
+    # Copy required nested fields
+    for field in SALESFORCE_OUTPUT_FIELDS:
+        if field in input_data and input_data[field] not in (None, '', [], {}):
+            payload[field] = input_data[field]
+    # Also ensure we have Opportunity__c and Lead__c if available
+    if 'Opportunity__c' not in payload and 'opportunity' in input_data and isinstance(input_data['opportunity'], dict):
+        payload['Opportunity__c'] = input_data['opportunity'].get('tagged_id')
+    if 'Lead__c' not in payload and 'lead' in input_data and isinstance(input_data['lead'], dict):
+        payload['Lead__c'] = input_data['lead'].get('tagged_id')
+    return payload
+
+
+def build_salesforce_compatible_payload(data):
+    """Return payload with flat Salesforce fields; preserves already-flat files."""
+    payload = dict(data or {})
+
+    if 'monitorUCID' in payload:
+        payload['monitorUcid__c'] = payload.get('monitorUCID')
+
+    transcript_block = payload.get('call_transcription') or {}
+    transcript_text = ''
+    if isinstance(transcript_block, dict):
+        transcript_text = (
+            transcript_block.get('raw_transcript')
+            or transcript_block.get('rawTranscript')
+            or transcript_block.get('separated_transcript')
+            or transcript_block.get('separatedTranscript')
+            or ''
+        )
+    elif isinstance(transcript_block, str):
+        transcript_text = transcript_block
+
+    payload['Transcript__c'] = payload.get('Transcript__c') or transcript_text or 'No transcription available'
+    if isinstance(transcript_block, dict):
+        payload['Separated_Transcript__c'] = payload.get('Separated_Transcript__c') or (
+            transcript_block.get('separated_transcript')
+            or transcript_block.get('separatedTranscript')
+            or transcript_text
+            or 'No transcription available'
+        )
+    else:
+        payload['Separated_Transcript__c'] = payload.get('Separated_Transcript__c') or transcript_text or 'No transcription available'
+    payload['Transcript__c'] = clean_salesforce_text_value(payload.get('Transcript__c'))
+    payload['Separated_Transcript__c'] = clean_salesforce_text_value(payload.get('Separated_Transcript__c'))
+
+    insight_block = payload.get('call_insight') or {}
+    if isinstance(insight_block, dict):
+        payload['Call_Insight__c'] = payload.get('Call_Insight__c') or insight_block.get('summary') or 'No summary available'
+    elif isinstance(insight_block, str):
+        payload['Call_Insight__c'] = payload.get('Call_Insight__c') or insight_block
+    payload['Call_Insight__c'] = clean_salesforce_text_value(payload.get('Call_Insight__c'))
+
+    sentiment_block = payload.get('call_sentiment_analysis') or {}
+    if isinstance(sentiment_block, dict):
+        payload['Sentiment__c'] = payload.get('Sentiment__c') or sentiment_block.get('sentiment') or 'Unknown'
+    elif isinstance(sentiment_block, str):
+        payload['Sentiment__c'] = payload.get('Sentiment__c') or sentiment_block
+
+    # First check if any existing rating fields are already present
+    existing_rating = (
+        payload.get('call_Rating__c') 
+        or payload.get('Call_Rating__c') 
+        or payload.get('call_rating__c') 
+        or payload.get('Rating__c')
+    )
+    
+    if existing_rating:
+        payload['call_Rating__c'] = clean_salesforce_text_value(existing_rating)
+    else:
+        # Build rating from call_rating dict (check both lowercase and capitalized)
+        rating_block = payload.get('call_rating') or payload.get('call_Rating') or {}
+        if isinstance(rating_block, dict):
+            rating_value = (
+                rating_block.get('quality')  # Prioritize "quality" like test.py
+                or rating_block.get('rating')
+                or rating_block.get('score')
+                or 'Unknown'
             )
-            normalized["Transcript__c"] = raw or sep or "No transcription available"
-            normalized["Separated_Transcript__c"] = chunk_transcript(sep or raw) if (sep or raw) else ["No transcription available"]
-
-    # 3. Call_Insight__c
-    if "call_insight" in payload:
-        insight = payload["call_insight"]
-        if isinstance(insight, dict) and "summary" in insight:
-            normalized["Call_Insight__c"] = insight["summary"]
-        elif isinstance(insight, str):
-            normalized["Call_Insight__c"] = insight
-
-    # 4. Sentiment__c
-    if "call_sentiment_analysis" in payload:
-        sentiment = payload["call_sentiment_analysis"]
-        if isinstance(sentiment, dict) and "sentiment" in sentiment:
-            normalized["Sentiment__c"] = sentiment["sentiment"]
-        elif isinstance(sentiment, str):
-            normalized["Sentiment__c"] = sentiment
-
-    # 5. call_Rating__c
-    rating_value = payload.get("call_rating")
-    if rating_value:
-        if isinstance(rating_value, str):
-            normalized["call_Rating__c"] = rating_value
-        elif isinstance(rating_value, dict):
-            rating_parts = [f"Call Rating: {rating_value.get('rating', 'Unknown')}"]
-            reasons = ensure_list(rating_value.get("reasons", []), [])
+            rating_value = str(rating_value).strip() or 'Unknown'
+            rating_parts = [f"Call Rating: {rating_value}"]
+            reasons = ensure_list(rating_block.get('reasons', []), [])
             if reasons:
-                rating_parts.extend([f"Reason: {r}" for r in reasons])
-            normalized["call_Rating__c"] = "\n".join(rating_parts)
+                rating_parts.extend([f"Reason {i + 1}: {reason}" for i, reason in enumerate(reasons)])
+            rating_text = " | ".join(rating_parts)
+            payload['call_Rating__c'] = clean_salesforce_text_value(rating_text)
+        elif isinstance(rating_block, str):
+            payload['call_Rating__c'] = clean_salesforce_text_value(rating_block.strip())
+        else:
+            # Fallback: always set call_Rating__c to something
+            payload['call_Rating__c'] = clean_salesforce_text_value("Call Rating: Unknown")
+    
+    # Keep other variations for backward compatibility if needed
+    if payload.get('call_Rating__c'):
+        payload['Call_Rating__c'] = payload.get('Call_Rating__c') or payload['call_Rating__c']
+        payload['call_rating__c'] = payload.get('call_rating__c') or payload['call_Rating__c']
 
-    # 6. Caller_Tone_Emotion__c (from customer_details)
-    if "customer_details" in payload and isinstance(payload["customer_details"], dict):
-        if payload["customer_details"].get("caller_tone"):
-            normalized["Caller_Tone_Emotion__c"] = payload["customer_details"]["caller_tone"]
+    uui_id = _normalize_string(payload.get('UUI') or payload.get('uui'))
 
-    # 7. Opportunity__c
-    if "opportunity" in payload and isinstance(payload["opportunity"], dict):
-        if payload["opportunity"].get("tagged_id"):
-            normalized["Opportunity__c"] = payload["opportunity"]["tagged_id"]
+    opportunity_id = (
+        payload.get('Opportunity__c')
+        or payload.get('opportunity__c')
+        or payload.get('OpportunityId')
+        or payload.get('opportunityId')
+        or payload.get('opportunity_id_c')
+    )
+    if not opportunity_id and isinstance(payload.get('opportunity'), dict):
+        opportunity_id = (
+            payload['opportunity'].get('tagged_id')
+            or payload['opportunity'].get('opportunity_id_c')
+            or payload['opportunity'].get('id')
+        )
+    if not opportunity_id and uui_id and str(uui_id).startswith('006'):
+        opportunity_id = uui_id
+    opportunity_id = _normalize_string(opportunity_id)
+    if opportunity_id and str(opportunity_id).startswith('006'):
+        payload['Opportunity__c'] = opportunity_id
 
-    # 8. Lead__c
-    if "lead" in payload and isinstance(payload["lead"], dict):
-        if payload["lead"].get("tagged_id"):
-            normalized["Lead__c"] = payload["lead"]["tagged_id"]
+    lead_id = (
+        payload.get('Lead__c')
+        or payload.get('lead__c')
+        or payload.get('LeadId')
+        or payload.get('leadId')
+        or payload.get('WhoId')
+    )
+    if not lead_id and isinstance(payload.get('lead'), dict):
+        lead_id = (
+            payload['lead'].get('tagged_id')
+            or payload['lead'].get('id')
+            or payload['lead'].get('WhoId')
+        )
+    if not lead_id and uui_id and str(uui_id).startswith('00Q'):
+        lead_id = uui_id
+    lead_id = _normalize_string(lead_id)
+    if lead_id and str(lead_id).startswith('00Q'):
+        payload['Lead__c'] = lead_id
 
-    return normalized
+    # Add full analysis data as Additional_Data__c
+    try:
+        payload['Additional_Data__c'] = clean_salesforce_text_value(json.dumps(data, ensure_ascii=False))
+    except Exception:
+        payload['Additional_Data__c'] = None
+
+    return payload
+
+
+def validate_analysis_payload(data, file_key):
+    # Check for either 'call_rating' or 'call_Rating'
+    has_rating = bool(data.get('call_rating') or data.get('call_Rating'))
+    required_fields = ['monitorUCID', 'call_transcription', 'call_insight', 'call_sentiment_analysis']
+    missing = [f for f in required_fields if not data.get(f)]
+    if not has_rating:
+        missing.append('call_rating/call_Rating')
+
+    # Check for lead or opportunity
+    has_lead_or_opp = (
+        (data.get('lead') and isinstance(data.get('lead'), dict) and data.get('lead').get('tagged_id'))
+        or (data.get('Lead__c'))
+        or (data.get('opportunity') and isinstance(data.get('opportunity'), dict) and data.get('opportunity').get('tagged_id'))
+        or (data.get('Opportunity__c'))
+    )
+    if not has_lead_or_opp:
+        logger.error(f"[VALIDATION FAILED] {file_key} missing lead or opportunity tagging")
+        missing.append('lead/opportunity')
+
+    if missing:
+        logger.error(f"[VALIDATION FAILED] {file_key} missing canonical fields: {missing}")
+        return False
+
+    transcript_block = data.get('call_transcription')
+    if not isinstance(transcript_block, dict):
+        logger.error(f"[VALIDATION FAILED] {file_key} call_transcription is not a dict")
+        return False
+
+    if not (
+        transcript_block.get('raw_transcript')
+        or transcript_block.get('separated_transcript')
+        or transcript_block.get('rawTranscript')
+        or transcript_block.get('separatedTranscript')
+    ):
+        logger.error(f"[VALIDATION FAILED] {file_key} missing transcript text")
+        return False
+
+    rating_block = data.get('call_rating') or data.get('call_Rating')
+    if isinstance(rating_block, dict):
+        if not (rating_block.get('rating') or rating_block.get('quality') or rating_block.get('score')):
+            logger.error(f"[VALIDATION FAILED] {file_key} missing rating value")
+            return False
+
+    logger.info(f"[VALIDATION PASSED] {file_key} has canonical analysis fields")
+    return True
 
 
 def should_skip_salesforce_push(data):
     payload = data or {}
     transcript_block = payload.get("call_transcription") or {}
-    transcript_text = ""
+    transcript_text = payload.get("Separated_Transcript__c") or payload.get("Transcript__c") or ""
     if isinstance(transcript_block, dict):
         transcript_text = (
             transcript_block.get("separated_transcript")
             or transcript_block.get("separatedTranscript")
             or transcript_block.get("raw_transcript")
             or transcript_block.get("rawTranscript")
-            or ""
+            or transcript_text
         )
     elif isinstance(transcript_block, str):
         transcript_text = transcript_block
     return str(transcript_text).strip() == SHORT_CALL_TRANSCRIPT
+
+
+def _salesforce_text_matches(value, expected):
+    return str(value or "").strip().lower() == expected.lower()
+
+
+def _salesforce_text_contains(value, expected):
+    return expected.lower() in str(value or "").strip().lower()
+
+
+def is_missing_audio_placeholder_payload(payload):
+    payload = payload or {}
+    description = payload.get("Description__c")
+    description_is_blank = description is None or str(description).strip().lower() in ("", "null", "none")
+    rating_text = (
+        payload.get("call_Rating__c")
+        or payload.get("Call_Rating__c")
+        or payload.get("call_rating__c")
+        or payload.get("Rating__c")
+    )
+
+    return (
+        _salesforce_text_matches(payload.get("Sentiment__c"), "Unknown")
+        and _salesforce_text_matches(payload.get("Transcript__c"), MISSING_AUDIO_TRANSCRIPT)
+        and _salesforce_text_matches(payload.get("Separated_Transcript__c"), MISSING_AUDIO_TRANSCRIPT)
+        and _salesforce_text_matches(payload.get("Call_Insight__c"), MISSING_AUDIO_REASON)
+        and _salesforce_text_contains(rating_text, MISSING_AUDIO_REASON)
+        and description_is_blank
+    )
 
 
 # ============================================================
@@ -2209,64 +3080,25 @@ def should_skip_salesforce_push(data):
 
 def create_json_output(file_key, transcript, insights, callquality, separated, customer_details, call_to_action=None):
     logger.info(f"Processing insights: {insights!r}")
-    logger.debug(f"[CREATE_JSON] Input check - transcript:{bool(transcript)} | insights:{bool(insights)} | quality:{bool(callquality)}")
-    try:
-        insight_summary, sentiment = insights
-    except (TypeError, ValueError) as e:
-        logger.error(f"Error unpacking insights: {e}. Insights: {insights!r}")
-        insight_summary = "Error: Could not extract summary"
-        sentiment = "Error: Could not extract sentiment"
-
-    json_data     = get_json_from_cos(COS_BUCKET, file_key)
-    monitor_ucid  = get_monitor_ucid(json_data)
-    uui           = get_uui(json_data)
-    transcript_value  = transcript if transcript else "No transcription available"
-    separated_source  = separated if separated else transcript_value
-    separated_value   = format_transcript_for_storage(separated_source)
-    rating_data       = parse_call_quality(callquality)
-    action_items      = clean_call_to_action_items(call_to_action)
-    request_points    = build_request_points(callquality, action_items)
-
-    logger.debug(f"[CREATE_JSON] Transcript condition - transcript_value:{transcript_value[:50] if isinstance(transcript_value, str) else type(transcript_value)}")
-
-    output_data = {
-        "monitorUCID": monitor_ucid,
-        "UUI": uui,
-        "customer_details": customer_details or {},
-        "call_transcription": {
-            "separated_transcript": (
-                separated_value
-                if transcript not in ["No audio URL is available", "Call is less than 15 sec"]
-                else format_transcript_for_storage(transcript_value)
-            )
-        }
-    }
-
-    if transcript not in ["No audio URL is available", "Call is less than 15 sec"]:
-        logger.info(f"[CREATE_JSON] {file_key} - Adding full enrichment (transcript length: {len(transcript_value) if isinstance(transcript_value, str) else 0})")
-        output_data.update({
-            "call_insight":            {"summary": insight_summary},
-            "call_to_action":          request_points,
-            "call_rating":             {"rating": rating_data["rating"], "reasons": rating_data["reasons"]},
-            "call_sentiment_analysis": {"sentiment": sentiment}
-        })
-    else:
-        logger.warning(f"[CREATE_JSON] {file_key} - SHORT CALL DETECTED: {transcript} - Using forced defaults only")
-        output_data.update({
-            "call_to_action":          FORCED_CALL_TO_ACTION_ITEMS.copy(),
-            "call_rating":             {"rating": FORCED_CALL_RATING, "reasons": ["Call could not be analyzed."]},
-            "call_sentiment_analysis": {"sentiment": "Unknown"}
-        })
+    json_data = get_json_from_cos(COS_BUCKET, file_key)
 
     try:
-        # ── First: Enrich with Lead / Opportunity from Presto ──────────────────────
+        initial_output = build_analysis_payload(
+            file_key=file_key,
+            transcript=transcript,
+            insights=insights,
+            callquality=callquality,
+            separated=separated,
+            customer_details=customer_details,
+            call_to_action=call_to_action,
+            json_data=json_data,
+            source="create_json_output"
+        )
+
         logger.info(f"[CREATE_JSON] COS JSON keys for enrichment: {list((json_data or {}).keys())}")
-        output_data = enrich_response_with_lead_opportunity(output_data, json_data)
-        logger.info(f"[CREATE_JSON] Output keys after enrichment: {list(output_data.keys())}")
-        # ── Then: Normalize to Salesforce field names ─────────────────────────────
-        output_data = normalize_salesforce_payload(output_data)
-        # ────────────────────────────────────────────────────────────────────────────
-
+        output_data = enrich_response_with_lead_opportunity(initial_output, json_data)
+        
+        logger.info(f"[CREATE_JSON] Full output keys: {list(output_data.keys())}")
         json_str    = json.dumps(output_data, indent=2, ensure_ascii=False)
         temp_path   = get_output_json_path(file_key)
         filename    = os.path.basename(temp_path)
@@ -2275,7 +3107,6 @@ def create_json_output(file_key, transcript, insights, callquality, separated, c
         if has_request_context():
             session['json_filename']    = filename
             session['json_path']        = temp_path
-            # Don't store large data in session cookie—keep it small!
             logger.info(f"Stored JSON output in session: {temp_path}")
         else:
             logger.info(f"Created JSON output (batch mode): {temp_path}")
@@ -2747,6 +3578,50 @@ def process_chunk_separatespeakers(chunk, chunk_index, total_chunks, call_type='
                 else:
                     line = line.replace('Speaker1:', 'Customer:').replace('Speaker2:', 'Agent:')
                 clean_lines.append(line)
+
+        # Guard against WatsonX repetition loops: if the model gets stuck
+        # repeating the same exchange (e.g. "Customer: ... Agent: Ok sir no
+        # problem sir. Thank you have a good day." dozens of times), drop
+        # the runaway repeats. Keep at most 2 consecutive occurrences of any
+        # identical line.
+        deduped_lines = []
+        repeat_count = 0
+        for line in clean_lines:
+            if deduped_lines and line == deduped_lines[-1]:
+                repeat_count += 1
+                if repeat_count >= 2:
+                    continue
+            else:
+                repeat_count = 0
+            deduped_lines.append(line)
+
+        # Also catch repeated PAIRS of lines (e.g. a Customer/Agent exchange
+        # that repeats as a 2-line block over and over).
+        final_lines = []
+        i = 0
+        while i < len(deduped_lines):
+            if (
+                i + 3 < len(deduped_lines)
+                and deduped_lines[i] == deduped_lines[i + 2]
+                and deduped_lines[i + 1] == deduped_lines[i + 3]
+            ):
+                # Found a repeating 2-line block; keep one occurrence and
+                # skip the rest of the run.
+                final_lines.append(deduped_lines[i])
+                final_lines.append(deduped_lines[i + 1])
+                j = i + 2
+                while (
+                    j + 1 < len(deduped_lines)
+                    and deduped_lines[j] == deduped_lines[i]
+                    and deduped_lines[j + 1] == deduped_lines[i + 1]
+                ):
+                    j += 2
+                i = j
+            else:
+                final_lines.append(deduped_lines[i])
+                i += 1
+
+        clean_lines = final_lines
         return chunk_index, '\n'.join(clean_lines) if clean_lines else chunk
     except requests.RequestException as e:
         logger.error(f"Separatespeakers chunk {chunk_index+1} failed: {e}")
@@ -3005,7 +3880,7 @@ def process_chunk_getcustomerdetails(chunk, chunk_index, total_chunks):
         {chunk or 'No transcription available'}
         """,
         "parameters": {
-            "decoding_method": "greedy", "max_new_tokens": 200,
+            "decoding_method": "greedy", "max_new_tokens": 600,
             "min_new_tokens": 20, "stop_sequences": ["/"],
             "repetition_penalty": 1.05, "temperature": 0.3
         },
@@ -3206,29 +4081,218 @@ def get_salesforce_access_token():
     raise last_error
 
 
+def check_duplicate_in_salesforce(monitor_ucid, token):
+    """Check Salesforce if a record with this monitorUcid__c already exists."""
+    monitor_ucid = str(monitor_ucid or '').strip()
+    if not monitor_ucid or monitor_ucid == "Unknown":
+        return False, None
+
+    try:
+        # Parse base URL from SALESFORCE_API_URL
+        base_url = SALESFORCE_API_URL
+        if "/services/data/" in base_url:
+            base_url = base_url.split("/services/data/")[0]
+        
+        # SOQL query to find existing record
+        soql = f"SELECT Id FROM Call_Transcript__c WHERE monitorUcid__c = '{_escape_soql_string(monitor_ucid)}' LIMIT 1"
+        query_url = f"{base_url}/services/data/v58.0/query?q={requests.utils.quote(soql)}"
+        
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        response = requests.get(query_url, headers=headers, timeout=(30, 60))
+        
+        if response.status_code == 200:
+            response_json = response.json()
+            if response_json.get('totalSize', 0) > 0:
+                return True, response_json.get('records', [{}])[0].get('Id')
+        
+        return False, None
+    except Exception as e:
+        logger.error(f"Error checking duplicate in Salesforce for monitorUCID {monitor_ucid}: {str(e)[:200]}")
+        return False, None
+
+
+def should_skip_existing_salesforce_record(file_key, json_data):
+    monitor_ucid = get_monitor_ucid(json_data)
+    if not monitor_ucid or monitor_ucid == "Unknown":
+        logger.info(f"[PREFLIGHT] {file_key} has no monitorUCID; duplicate check skipped")
+        return False
+
+    try:
+        _check_batch_pause(file_key, "Salesforce duplicate preflight")
+        token = get_salesforce_access_token()
+        duplicate_exists, sf_record_id = check_duplicate_in_salesforce(monitor_ucid, token)
+        if not duplicate_exists:
+            return False
+
+        logger.info(
+            f"[PREFLIGHT SKIP] {file_key} - monitorUcid__c {monitor_ucid} "
+            f"already exists in Salesforce (Id: {sf_record_id})"
+        )
+        _record_push_event(
+            'already_pushed',
+            file_key=file_key,
+            monitor_ucid=monitor_ucid,
+            salesforce_id=sf_record_id,
+            preflight=True
+        )
+        release_push_attempt(file_key, success=True, monitor_ucid=monitor_ucid)
+        persist_pushed_file(file_key, monitor_ucid=monitor_ucid)
+        return True
+    except BatchPauseRequested:
+        raise
+    except Exception as e:
+        logger.warning(f"[PREFLIGHT] Duplicate check failed for {file_key}; continuing with processing: {str(e)[:200]}")
+        return False
+
+
 def push_to_salesforce(data, file_key):
     _check_batch_pause(file_key, "Salesforce push preparation")
 
-    if not validate_enriched_payload(data, file_key):
-        logger.error(f"[PUSH ABORT] {file_key} - Payload validation failed. Not pushing incomplete data.")
-        return 'validation_failed'
-
-    logger.warning(f"[PUSH DEBUG] {file_key} input data keys: {list((data or {}).keys())}")
-    if data:
-        for key in ['call_transcription', 'call_insight', 'call_sentiment_analysis', 'call_rating']:
-            logger.debug(f"  - {key}: {bool(data.get(key))}")
-
-    if should_skip_salesforce_push(data):
-        logger.info(f"[PUSH SKIP] {file_key} is a short call; not pushing")
-        return 'short_duration'
-
-    if not is_file_key_in_current_window(file_key):
-        logger.warning(f"[PUSH SKIP] {file_key} is outside the allowed date window")
+    if has_request_context() and not is_file_key_in_current_window(file_key):
+        logger.warning(f"[PUSH SKIP] {file_key} outside allowed COS LastModified date window {_describe_cos_date_window()}")
         return 'out_of_range'
 
-    monitor_ucid    = get_monitor_ucid(data)
-    safety_tag      = f"monitorUCID:{monitor_ucid}" if monitor_ucid != 'Unknown' else 'monitorUCID:unknown'
-    reservation     = reserve_push_attempt(file_key, monitor_ucid=monitor_ucid)
+    input_payload = data if isinstance(data, dict) else {}
+
+    # ============================================================
+    # DEBUG LOGGING - Check what we have before extraction
+    # ============================================================
+    logger.info(f"[PUSH DEBUG] {file_key} - input_payload keys: {list(input_payload.keys())}")
+    logger.info(f"[PUSH DEBUG] {file_key} - lead in payload: {input_payload.get('lead')}")
+    logger.info(f"[PUSH DEBUG] {file_key} - opportunity in payload: {input_payload.get('opportunity')}")
+    logger.info(f"[PUSH DEBUG] {file_key} - UUI: {input_payload.get('UUI') or input_payload.get('uui')}")
+    
+    # ============================================================
+    # EXTRACT OPPORTUNITY AND LEAD IDs
+    # ============================================================
+    opportunity_id, lead_id = extract_salesforce_link_ids(input_payload)
+    logger.info(f"[PUSH DEBUG] {file_key} - Extracted opportunity_id: {opportunity_id}")
+    logger.info(f"[PUSH DEBUG] {file_key} - Extracted lead_id: {lead_id}")
+
+    if should_skip_salesforce_push(input_payload):
+        if is_missing_audio_payload(input_payload):
+            logger.info(f"[PUSH SKIP] {file_key} has no audio URL placeholder data; not pushing")
+        else:
+            logger.info(f"[PUSH SKIP] {file_key} is a short call; not pushing")
+        return 'short_duration'
+
+    # ============================================================
+    # BUILD PAYLOAD
+    # ============================================================
+    payload_to_send = {}
+
+    # Preserve already-flat Salesforce payloads as well as nested analysis output.
+    for field in ("monitorUcid__c", "Transcript__c", "Separated_Transcript__c", "Call_Insight__c", "Sentiment__c"):
+        if input_payload.get(field):
+            payload_to_send[field] = clean_salesforce_text_value(input_payload.get(field))
+    for field in ("call_Rating__c", "Call_Rating__c", "call_rating__c"):
+        if input_payload.get(field):
+            payload_to_send[field] = clean_salesforce_text_value(input_payload.get(field))
+    
+    # Add monitorUcid__c
+    if input_payload.get("monitorUCID"):
+        payload_to_send["monitorUcid__c"] = input_payload["monitorUCID"]
+
+    # Add transcript fields
+    transcription_data = input_payload.get("call_transcription", {})
+    if isinstance(transcription_data, dict):
+        raw_transcript = clean_salesforce_text_value(transcription_data.get("raw_transcript", ""))
+        separated_transcript = clean_salesforce_text_value(transcription_data.get("separated_transcript", ""))
+        if raw_transcript:
+            payload_to_send["Transcript__c"] = raw_transcript
+        if separated_transcript:
+            payload_to_send["Separated_Transcript__c"] = separated_transcript
+
+    # Add call insight field
+    insight_data = input_payload.get("call_insight", {})
+    if isinstance(insight_data, dict):
+        insight_summary = clean_salesforce_text_value(insight_data.get("summary", ""))
+        if insight_summary:
+            payload_to_send["Call_Insight__c"] = insight_summary
+
+    # Add sentiment field
+    sentiment_data = input_payload.get("call_sentiment_analysis", {})
+    if isinstance(sentiment_data, dict) and sentiment_data.get("sentiment"):
+        payload_to_send["Sentiment__c"] = sentiment_data.get("sentiment", "")
+
+    # Add call rating field (from "quality" key)
+    rating_data = input_payload.get("call_rating", {})
+    if isinstance(rating_data, dict):
+        rating_value = rating_data.get("quality", "Unknown")
+        # Try to parse and format the rating nicely
+        try:
+            parsed_rating = parse_call_quality(rating_value)
+            if parsed_rating.get("rating") and parsed_rating.get("rating") != "Unknown":
+                rating_parts = [f"Call Rating: {parsed_rating['rating']}"]
+                if parsed_rating.get("reasons"):
+                    rating_parts.extend([f"Reason {i + 1}: {reason}" for i, reason in enumerate(parsed_rating["reasons"])])
+                final_rating_text = " | ".join(rating_parts)
+            else:
+                final_rating_text = f"Call Rating: {rating_value}"
+        except Exception as e:
+            final_rating_text = f"Call Rating: {rating_value}"
+        payload_to_send["call_Rating__c"] = payload_to_send.get("call_Rating__c") or clean_salesforce_text_value(final_rating_text)
+        # Also add variations for compatibility
+        payload_to_send["Call_Rating__c"] = payload_to_send["call_Rating__c"]
+        payload_to_send["call_rating__c"] = payload_to_send["call_Rating__c"]
+
+    # ============================================================
+    # ADD OPPORTUNITY AND LEAD IDs (with validation)
+    # ============================================================
+    if opportunity_id:
+        payload_to_send["Opportunity__c"] = opportunity_id
+        payload_to_send["OpportunityId"] = opportunity_id
+        logger.info(f"[PUSH] {file_key} - ✓ Setting Opportunity__c = {opportunity_id} and OpportunityId = {opportunity_id}")
+    else:
+        logger.warning(f"[PUSH] {file_key} - ✗ No opportunity_id found to set Opportunity__c/OpportunityId")
+    
+    if lead_id:
+        payload_to_send["Lead__c"] = lead_id
+        payload_to_send["LeadId"] = lead_id
+        logger.info(f"[PUSH] {file_key} - ✓ Setting Lead__c = {lead_id} and LeadId = {lead_id}")
+    else:
+        logger.warning(f"[PUSH] {file_key} - ✗ No lead_id found to set Lead__c/LeadId")
+    
+    # Also check if there are direct fields in the input payload
+    if input_payload.get("Opportunity__c") and not opportunity_id:
+        logger.warning(f"[PUSH LINK CHECK] Ignoring invalid Opportunity__c={input_payload.get('Opportunity__c')!r}")
+    if input_payload.get("Lead__c") and not lead_id:
+        logger.warning(f"[PUSH LINK CHECK] Ignoring invalid Lead__c={input_payload.get('Lead__c')!r}")
+
+    # Keep the original nested fields too (optional, for debugging)
+    for field in ["monitorUCID", "call_transcription", "call_insight", "call_rating", "call_sentiment_analysis", "opportunity", "lead"]:
+        if input_payload.get(field):
+            payload_to_send[field] = input_payload[field]
+
+    logger.info(f"[PUSH] {file_key} - payload_to_send keys: {list(payload_to_send.keys())}")
+    logger.info(f"[PUSH] {file_key} - Opportunity__c: {payload_to_send.get('Opportunity__c')}")
+    logger.info(f"[PUSH] {file_key} - Lead__c: {payload_to_send.get('Lead__c')}")
+
+    # ============================================================
+    # VALIDATION
+    # ============================================================
+    has_lead_or_opp = payload_to_send.get("Opportunity__c") or payload_to_send.get("Lead__c")
+    has_transcript = payload_to_send.get("Transcript__c") or payload_to_send.get("Separated_Transcript__c")
+    
+    if not has_lead_or_opp:
+        logger.error(f"[PUSH ABORT] {file_key} - No lead or opportunity tagged")
+        logger.error(f"[PUSH ABORT] {file_key} - Opportunity__c: {payload_to_send.get('Opportunity__c')}")
+        logger.error(f"[PUSH ABORT] {file_key} - Lead__c: {payload_to_send.get('Lead__c')}")
+        return 'validation_failed'
+    
+    if not has_transcript:
+        logger.error(f"[PUSH ABORT] {file_key} - No transcript data")
+        return 'validation_failed'
+
+    if should_skip_salesforce_push(payload_to_send):
+        if is_missing_audio_payload(payload_to_send):
+            logger.info(f"[PUSH SKIP] {file_key} has no audio URL placeholder data; not pushing")
+        else:
+            logger.info(f"[PUSH SKIP] {file_key} is a short call; not pushing")
+        return 'short_duration'
+
+    monitor_ucid = payload_to_send.get("monitorUcid__c") or "Unknown"
+    reservation = reserve_push_attempt(file_key, monitor_ucid=monitor_ucid)
 
     if reservation == 'already_pushed':
         logger.info(f"[PUSH SKIP] {file_key} already pushed")
@@ -3240,47 +4304,68 @@ def push_to_salesforce(data, file_key):
     push_start = time.time()
     with push_stats_lock:
         push_stats['total_push_attempts'] += 1
-        push_stats['last_push_time']       = datetime.now().isoformat()
+        push_stats['last_push_time'] = datetime.now().isoformat()
 
     try:
-        transcription_data  = data.get('Transcript__c', {}) or data.get('call_transcription', {})
-        separated_transcript = transcription_data.get('separated_transcript', '') if isinstance(transcription_data, dict) else (transcription_data if isinstance(transcription_data, str) else '')
-        transcript_length    = len(separated_transcript) if separated_transcript else 0
+        separated_transcript = payload_to_send.get("Separated_Transcript__c") or ""
+        transcript_length = len(separated_transcript) if separated_transcript else 0
 
-        if 'Transcript__c' in data or 'call_transcription' in data:
+        if separated_transcript:
             with push_stats_lock:
                 push_stats['total_transcriptions_pushed'] += 1
             logger.info(f"[PUSH] Pushing transcription for {file_key} — {transcript_length} chars")
 
         _check_batch_pause(file_key, "Salesforce access token request")
-        t0           = time.time()
-        token        = get_salesforce_access_token()
-        access_dur   = time.time() - t0
-        headers      = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        t0 = time.time()
+        token = get_salesforce_access_token()
+        access_dur = time.time() - t0
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        # Check if data is already normalized (has Salesforce field names)
-        is_already_normalized = 'Transcript__c' in data or 'Separated_Transcript__c' in data
-        normalized_data = data if is_already_normalized else normalize_salesforce_payload(data)
+        # Check for duplicate in Salesforce
+        if monitor_ucid and monitor_ucid != "Unknown":
+            duplicate_exists, sf_record_id = check_duplicate_in_salesforce(monitor_ucid, token)
+            if duplicate_exists:
+                logger.info(f"[PUSH SKIP] {file_key} - Record with monitorUcid__c {monitor_ucid} already exists in Salesforce (Id: {sf_record_id})")
+                _record_push_event('already_pushed', file_key=file_key, monitor_ucid=monitor_ucid, transcript_length=transcript_length)
+                release_push_attempt(file_key, success=False, monitor_ucid=monitor_ucid)
+                return 'already_pushed'
 
-        logger.debug(f"Raw data keys for {file_key}: {list(data.keys()) if data else 'None'}")
-        logger.debug(f"[NORMALIZATION] Already normalized: {is_already_normalized}")
-        logger.info(f"Salesforce payload for {file_key}: {json.dumps(normalized_data, ensure_ascii=False)[:1000]}")
+        logger.info(f"[PUSH LINK CHECK] {file_key} | Opportunity__c={payload_to_send.get('Opportunity__c') or 'None'} | Lead__c={payload_to_send.get('Lead__c') or 'None'}")
+        
+        # Log the full payload for debugging (truncated)
+        payload_str = json.dumps(payload_to_send, ensure_ascii=False)
+        logger.info(f"Salesforce payload for {file_key}: {payload_str[:3000]}")
 
         enforce_request_gap('salesforce_push', SALESFORCE_PUSH_INTERVAL_SECONDS)
         _check_batch_pause(file_key, "Salesforce API request")
-        t1           = time.time()
-        response     = requests.post(SALESFORCE_API_URL, headers=headers, json=normalized_data, timeout=(30, 300))
-        request_dur  = time.time() - t1
-        total_dur    = time.time() - push_start
+        t1 = time.time()
+        response = requests.post(SALESFORCE_API_URL, headers=headers, json=payload_to_send, timeout=(30, 300))
+        request_dur = time.time() - t1
+        total_dur = time.time() - push_start
 
         if response.status_code in (200, 201, 204):
             with push_stats_lock:
                 push_stats['successful_pushes'] += 1
                 current_pushed = push_stats['successful_pushes']
             logger.info(f"[PUSH SUCCESS] {file_key} | Total={current_pushed} | access={access_dur:.2f}s req={request_dur:.2f}s total={total_dur:.2f}s")
+            
+            # Try to get Salesforce record ID from response to verify
+            salesforce_id = None
+            try:
+                response_json = response.json()
+                salesforce_id = response_json.get('id')
+                logger.info(f"[VERIFY] Got Salesforce record ID: {salesforce_id}")
+            except Exception as e:
+                logger.debug(f"[VERIFY] Could not parse Salesforce response for ID: {e}")
+            
+            # Verify the record if we have an ID
+            if salesforce_id:
+                verify_salesforce_record(salesforce_id, payload_to_send, token)
+            
             _record_push_event('success', file_key=file_key, monitor_ucid=monitor_ucid, transcript_length=transcript_length,
                                status_code=response.status_code, access_time=round(access_dur, 2),
-                               request_time=round(request_dur, 2), total_time=round(total_dur, 2))
+                               request_time=round(request_dur, 2), total_time=round(total_dur, 2),
+                               salesforce_id=salesforce_id)
             release_push_attempt(file_key, success=True, monitor_ucid=monitor_ucid)
             persist_pushed_file(file_key, monitor_ucid=monitor_ucid)
             return 'pushed'
@@ -3288,11 +4373,24 @@ def push_to_salesforce(data, file_key):
             with push_stats_lock:
                 push_stats['failed_pushes'] += 1
                 push_stats['transcription_errors'] += 1
-            logger.error(f"[PUSH FAILED] {file_key} | Status={response.status_code} | total={total_dur:.2f}s")
+            response_text = response.text or ''
+            logger.error(f"[PUSH FAILED] {file_key} | Status={response.status_code} | Response={response_text[:500]} | total={total_dur:.2f}s")
             _record_push_event('failed', file_key=file_key, monitor_ucid=monitor_ucid, transcript_length=transcript_length,
-                               status_code=response.status_code, error=(response.text or '')[:200],
+                               status_code=response.status_code, error=response_text[:200],
                                access_time=round(access_dur, 2), request_time=round(request_dur, 2), total_time=round(total_dur, 2))
             release_push_attempt(file_key, success=False, monitor_ucid=monitor_ucid)
+
+            # Detect the Apex governor-limit error
+            if 'LimitException' in response_text and 'Too many query rows' in response_text:
+                logger.error(
+                    f"[PUSH ABORT - APEX LIMIT] {file_key} | Salesforce Apex class "
+                    f"CreateCallTranscriptFromJsonAPI is hitting a SOQL governor limit "
+                    f"(Too many query rows: 50001). This is independent of payload "
+                    f"content and will fail for ALL pushes until fixed on the "
+                    f"Salesforce/Apex side. Escalate to Salesforce admin."
+                )
+                return 'apex_limit_error'
+
             return 'failed'
 
     except BatchPauseRequested:
@@ -3313,6 +4411,58 @@ def push_to_salesforce(data, file_key):
             push_stats['failed_pushes'] += 1
         release_push_attempt(file_key, success=False)
         return 'failed'
+
+
+def verify_salesforce_record(salesforce_id, expected_payload, token):
+    """
+    Verify the created Salesforce record by querying it back and checking fields.
+    Logs any discrepancies or null fields.
+    """
+    if not salesforce_id:
+        logger.warning("[VERIFY] No Salesforce ID provided to verify")
+        return
+
+    # Parse Salesforce API URL to get base URL
+    base_url = SALESFORCE_API_URL
+    if "/services/data/" in base_url:
+        base_url = base_url.split("/services/data/")[0]
+
+    # Query the record
+    query_fields = ", ".join(SALESFORCE_OUTPUT_FIELDS)
+    query_url = f"{base_url}/services/data/v58.0/sobjects/Call_Transcript__c/{salesforce_id}?fields={query_fields}"
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    try:
+        response = requests.get(query_url, headers=headers, timeout=(30, 60))
+        if response.status_code == 200:
+            sf_record = response.json()
+            logger.info(f"[VERIFY] Retrieved Salesforce record {salesforce_id}")
+            
+            # Check each field
+            null_fields = []
+            for field in SALESFORCE_OUTPUT_FIELDS:
+                sf_value = sf_record.get(field)
+                expected_value = expected_payload.get(field)
+                
+                if sf_value in (None, "", [], {}):
+                    null_fields.append(field)
+                    logger.warning(f"[VERIFY] Field '{field}' is NULL/empty in Salesforce!")
+                else:
+                    logger.debug(f"[VERIFY] Field '{field}': OK (value present)")
+            
+            if null_fields:
+                logger.warning(f"[VERIFY] Record {salesforce_id} has NULL fields: {null_fields}")
+            else:
+                logger.info(f"[VERIFY] Record {salesforce_id} has all fields populated!")
+            
+            return sf_record
+        else:
+            logger.error(f"[VERIFY] Failed to retrieve record {salesforce_id}: {response.status_code} {response.text[:300]}")
+            return None
+    except Exception as e:
+        logger.error(f"[VERIFY] Error verifying record {salesforce_id}: {str(e)[:200]}")
+        return None
 
 
 # ============================================================
@@ -3347,6 +4497,13 @@ def process_single_json(file_key):
     logger.info(f"Processing JSON file: {file_key}")
     try:
         _check_batch_pause(file_key, "file start")
+        json_data = get_json_from_cos(COS_BUCKET, file_key)
+        if not json_data:
+            logger.error(f"Failed to retrieve JSON data from COS for {file_key}")
+            return file_key, 'failed', ["Failed to retrieve JSON data from COS"]
+        if should_skip_existing_salesforce_record(file_key, json_data):
+            return file_key, 'already_pushed', []
+
         errors, separated, insights, callquality, transcript, customer_details, call_to_action = process_audio_from_cos(file_key)
 
         logger.warning(f"[EXTRACTION RESULTS] {file_key} | transcript:{len(transcript) if transcript else 0} chars | insights:{bool(insights)} | quality:{bool(callquality)} | errors:{errors}")
@@ -3368,8 +4525,16 @@ def process_single_json(file_key):
 
         logger.info(f"[PUSH ATTEMPT] Starting push for {file_key} (~{transcript_length} chars) | enriched keys: {list(output_data.keys())}")
         logger.debug(f"[ENRICHED DATA] Full structure: {json.dumps({k: type(v).__name__ for k, v in output_data.items()}, ensure_ascii=False)}")
-        logger.warning(f"[DATA CHECKPOINT] {file_key} | transcript:{bool(output_data.get('call_transcription'))} | insight:{bool(output_data.get('call_insight'))} | sentiment:{bool(output_data.get('call_sentiment_analysis'))} | rating:{bool(output_data.get('call_rating'))}")
-        if not any([output_data.get(k) for k in ['call_transcription', 'call_insight', 'call_sentiment_analysis', 'call_rating']]):
+        has_compact_fields = any(output_data.get(k) for k in ['Transcript__c', 'Separated_Transcript__c', 'Call_Insight__c', 'Sentiment__c', 'call_Rating__c'])
+        has_canonical_fields = any(output_data.get(k) for k in ['call_transcription', 'call_insight', 'call_sentiment_analysis', 'call_rating'])
+        logger.warning(
+            f"[DATA CHECKPOINT] {file_key} | compact:{has_compact_fields} | "
+            f"transcript:{bool(output_data.get('call_transcription') or output_data.get('Transcript__c'))} | "
+            f"insight:{bool(output_data.get('call_insight') or output_data.get('Call_Insight__c'))} | "
+            f"sentiment:{bool(output_data.get('call_sentiment_analysis') or output_data.get('Sentiment__c'))} | "
+            f"rating:{bool(output_data.get('call_rating') or output_data.get('call_Rating__c'))}"
+        )
+        if not (has_canonical_fields or has_compact_fields):
             logger.error(f"[DATA EMPTY] {file_key} - All enrichment fields missing! Raw json_str keys: {list(json.loads(json_str).keys()) if json_str else 'None'}")
         _check_batch_pause(file_key, "Salesforce push")
         push_status = push_to_salesforce(output_data, file_key)
@@ -3379,6 +4544,8 @@ def process_single_json(file_key):
             return file_key, 'pushed', []
         elif push_status == 'short_duration':
             return file_key, 'short_duration', []
+        elif push_status == 'missing_audio_url':
+            return file_key, 'missing_audio_url', []
         elif push_status == 'already_pushed':
             return file_key, 'already_pushed', []
         elif push_status == 'push_in_progress':
@@ -3387,6 +4554,13 @@ def process_single_json(file_key):
             return file_key, 'out_of_range', ["File is outside the allowed date window"]
         elif push_status == 'validation_failed':
             return file_key, 'validation_failed', ["Payload missing required enrichment fields"]
+        elif push_status == 'apex_limit_error':
+            return file_key, 'apex_limit_error', [
+                "Salesforce Apex error: 'Too many query rows: 50001' in "
+                "CreateCallTranscriptFromJsonAPI. This is a Salesforce-side "
+                "issue unrelated to this file's data and will recur for every "
+                "file until fixed by a Salesforce admin."
+            ]
         else:
             return file_key, 'failed', ["Failed to push to Salesforce"]
 
@@ -3399,7 +4573,7 @@ def process_single_json(file_key):
 
 
 def process_and_push_all_jsons(max_workers=4, batch_size=100):
-    global PAUSE_PROCESSING, CANCEL_PROCESSING, BATCH_PROCESSING_COMPLETED, batch_thread
+    global PAUSE_PROCESSING, CANCEL_PROCESSING, BATCH_PROCESSING_COMPLETED, BATCH_PUSH_LIMIT_REACHED, batch_thread
     processed_files, failed_files, pushed_files, current_batch_start, total_files = set(), [], set(), 0, 0
 
     if not batch_run_lock.acquire(blocking=False):
@@ -3429,8 +4603,15 @@ def process_and_push_all_jsons(max_workers=4, batch_size=100):
 
         total_processed = len(processed_files)
         total_pushed    = len(pushed_files)
+        run_pushed      = 0
 
         for batch_start in range(current_batch_start, total_files, batch_size):
+            if run_pushed >= BATCH_PUSH_LIMIT:
+                BATCH_PUSH_LIMIT_REACHED = True
+                save_batch_state(processed_files, failed_files, pushed_files, pushed_monitor_registry or set(), batch_start, total_files)
+                logger.info(f"[BATCH LIMIT] Stopped automatically after {run_pushed} successful pushes")
+                return
+
             if CANCEL_PROCESSING:
                 logger.info(f"Cancel requested at batch start {batch_start}")
                 save_batch_state(processed_files, failed_files, pushed_files, pushed_monitor_registry or set(), batch_start, total_files)
@@ -3458,7 +4639,7 @@ def process_and_push_all_jsons(max_workers=4, batch_size=100):
                 future_to_file = {}
                 pending        = set()
 
-                while queued and len(pending) < max_workers:
+                while queued and len(pending) < max_workers and run_pushed + len(pending) < BATCH_PUSH_LIMIT:
                     if CANCEL_PROCESSING:
                         break
                     nf = queued.popleft()
@@ -3498,7 +4679,8 @@ def process_and_push_all_jsons(max_workers=4, batch_size=100):
                                 persist_processed_file(file_key, pushed=True)
                                 if push_status == 'pushed':
                                     total_pushed += 1
-                            elif push_status == 'short_duration':
+                                    run_pushed += 1
+                            elif push_status in ('short_duration', 'missing_audio_url'):
                                 total_processed += 1
                                 processed_files.add(file_key)
                                 persist_processed_file(file_key)
@@ -3529,7 +4711,13 @@ def process_and_push_all_jsons(max_workers=4, batch_size=100):
                         PAUSE_PROCESSING = False
                         return
 
-                    if not CANCEL_PROCESSING and not PAUSE_PROCESSING and queued:
+                    if run_pushed >= BATCH_PUSH_LIMIT:
+                        BATCH_PUSH_LIMIT_REACHED = True
+                        save_batch_state(processed_files, failed_files, pushed_files, pushed_monitor_registry or set(), batch_start, total_files)
+                        logger.info(f"[BATCH LIMIT] Stopped automatically after {run_pushed} successful pushes")
+                        return
+
+                    if not CANCEL_PROCESSING and not PAUSE_PROCESSING and queued and run_pushed + len(pending) < BATCH_PUSH_LIMIT:
                         nf  = queued.popleft()
                         nft = executor.submit(process_single_json, nf)
                         future_to_file[nft] = nf
@@ -3620,6 +4808,18 @@ def index():
                 transcript_lines = clean_transcript_lines(call_transcript)
                 action_items     = clean_call_to_action_items(call_to_action)
                 request_points   = build_request_points(callquality, action_items)
+                
+                # Create temp JSON output file for Salesforce push
+                create_json_output(
+                    file_key=selected_file,
+                    transcript=transcript,
+                    insights=insights,
+                    callquality=callquality,
+                    separated=separated,
+                    customer_details=customer_details,
+                    call_to_action=call_to_action
+                )
+                
                 return render_template(
                     'index.html',
                     json_files=cos_json_files,
@@ -3705,36 +4905,48 @@ def api_process_and_push():
         uui = get_uui(json_data)
         audio_url    = json_data.get('AudioFile', '').strip()
 
+        if should_skip_existing_salesforce_record(file_key, json_data):
+            return jsonify({
+                "status": "already_pushed",
+                "message": f"monitorUcid__c {monitor_ucid} already exists in Salesforce; skipped before processing",
+                "push_status": "already_pushed"
+            }), 200
+
         if not audio_url or not urllib.parse.urlparse(audio_url).scheme:
-            response = {
-                "monitorUCID": monitor_ucid,
-                "UUI": uui,
-                "customer_details": {},
-                "call_transcription": {"separated_transcript": "No audio URL is available"},
-                "call_to_action": FORCED_CALL_TO_ACTION_ITEMS.copy(),
-                "call_rating": {"rating": "Unknown", "reasons": ["Call could not be analyzed."]}
-            }
+            response = build_analysis_payload(
+                file_key=file_key,
+                transcript="No audio URL is available",
+                insights=["Not processed due to missing URL", "Unknown"],
+                callquality="Not processed due to missing URL",
+                separated="No audio URL is available",
+                customer_details={},
+                call_to_action=FORCED_CALL_TO_ACTION_ITEMS.copy(),
+                json_data=json_data,
+                source="api_process_and_push:no_audio"
+            )
             response = enrich_response_with_lead_opportunity(response, json_data)
-            response = normalize_salesforce_payload(response)
             logger.warning(f"[PROCESS & PUSH] {file_key} - No audio URL")
             return jsonify({
-                "status": "short_duration",
+                "status": "missing_audio_url",
                 "message": "No audio URL available",
+                "push_status": "missing_audio_url",
                 "data": response
             }), 200
 
         duration_seconds = parse_call_duration(json_data.get('CallDuration', '00:00:00'))
         if duration_seconds <= 15:
-            response = {
-                "monitorUCID": monitor_ucid,
-                "UUI": uui,
-                "customer_details": {},
-                "call_transcription": {"separated_transcript": "Call is less than 15 sec"},
-                "call_to_action": FORCED_CALL_TO_ACTION_ITEMS.copy(),
-                "call_rating": {"rating": "Unknown", "reasons": ["Call could not be analyzed."]}
-            }
+            response = build_analysis_payload(
+                file_key=file_key,
+                transcript="Call is less than 15 sec",
+                insights=["Not processed due to short duration", "Unknown"],
+                callquality="Not processed due to short duration",
+                separated="Call is less than 15 sec",
+                customer_details={},
+                call_to_action=FORCED_CALL_TO_ACTION_ITEMS.copy(),
+                json_data=json_data,
+                source="api_process_and_push:short_duration"
+            )
             response = enrich_response_with_lead_opportunity(response, json_data)
-            response = normalize_salesforce_payload(response)
             logger.warning(f"[PROCESS & PUSH] {file_key} - Call too short ({duration_seconds}s)")
             return jsonify({
                 "status": "short_duration",
@@ -3752,28 +4964,19 @@ def api_process_and_push():
                 "message": "Failed to extract audio/insights"
             }), 400
 
-        insight_summary, sentiment = insights
-        rating_data    = parse_call_quality(callquality)
-        action_items   = clean_call_to_action_items(call_to_action)
-        request_points = build_request_points(callquality, action_items)
-
-        response = {
-            "monitorUCID": monitor_ucid,
-            "UUI": uui,
-            "customer_details": customer_details or {},
-            "call_transcription": {
-                "separated_transcript": format_transcript_for_storage(
-                    separated if separated else (transcript if transcript else "No transcription available")
-                )
-            },
-            "call_insight":            {"summary": insight_summary},
-            "call_to_action":          request_points,
-            "call_rating":             {"rating": rating_data["rating"], "reasons": rating_data["reasons"]},
-            "call_sentiment_analysis": {"sentiment": sentiment}
-        }
+        response = build_analysis_payload(
+            file_key=file_key,
+            transcript=transcript,
+            insights=insights,
+            callquality=callquality,
+            separated=separated,
+            customer_details=customer_details,
+            call_to_action=call_to_action,
+            json_data=json_data,
+            source="api_process_and_push"
+        )
 
         response = enrich_response_with_lead_opportunity(response, json_data)
-        response = normalize_salesforce_payload(response)
 
         logger.info(f"[PROCESS & PUSH] Processing complete for {file_key}, proceeding to push")
 
@@ -3784,9 +4987,12 @@ def api_process_and_push():
             'pushed':          {"status": "success", "message": "Successfully processed and pushed to Salesforce"},
             'validation_failed': {"status": "validation_failed", "message": "Payload validation failed - missing enrichment fields"},
             'short_duration':  {"status": "short_duration", "message": "Call too short; not pushed"},
+            'missing_audio_url': {"status": "missing_audio_url", "message": "No audio URL available; not pushed"},
             'already_pushed':  {"status": "already_pushed", "message": "Already pushed to Salesforce"},
             'push_in_progress': {"status": "push_in_progress", "message": "Push already in progress"},
             'out_of_range':    {"status": "out_of_range", "message": "File outside date window"},
+            'apex_limit_error': {"status": "apex_limit_error", "message": "Salesforce Apex error: 'Too many query rows: 50001' in "
+                                  "CreateCallTranscriptFromJsonAPI. Salesforce-side issue; contact Salesforce admin."},
             'failed':          {"status": "failed", "message": "Push to Salesforce failed"}
         }
 
@@ -3825,67 +5031,75 @@ def api_process():
         uui = get_uui(json_data)
         audio_url    = json_data.get('AudioFile', '').strip()
 
+        transcript = ""
+        separated = ""
+        insight_summary = ""
+        sentiment = ""
+        callquality_val = ""
+        customer_details = {}
+        call_to_action = []
+        opportunity_id = None
+
         if not audio_url or not urllib.parse.urlparse(audio_url).scheme:
-            response = {
-                "monitorUCID": monitor_ucid,
-                "UUI": uui,
-                "customer_details": {},
-                "call_transcription": {"separated_transcript": "No audio URL is available"},
-                "call_to_action": FORCED_CALL_TO_ACTION_ITEMS.copy(),
-                "call_rating": {"rating": "Unknown", "reasons": ["Call could not be analyzed."]}
-            }
-            # ── First: Enrich with Lead / Opportunity from Presto ──
-            response = enrich_response_with_lead_opportunity(response, json_data)
-            # ── Then: Normalize to Salesforce field names ──────────
-            response = normalize_salesforce_payload(response)
-            return jsonify(response), 200
+            transcript = "No audio URL is available"
+            separated = "No audio URL is available"
+            insight_summary = "Not processed due to missing URL"
+            sentiment = "Unknown"
+            callquality_val = "Not processed due to missing URL"
+            call_to_action = FORCED_CALL_TO_ACTION_ITEMS.copy()
+        elif parse_call_duration(json_data.get('CallDuration', '00:00:00')) <= 15:
+            transcript = "Call is less than 15 sec"
+            separated = "Call is less than 15 sec"
+            insight_summary = "Not processed due to short duration"
+            sentiment = "Unknown"
+            callquality_val = "Not processed due to short duration"
+            call_to_action = FORCED_CALL_TO_ACTION_ITEMS.copy()
+        else:
+            errors, separated, insights, callquality_val, transcript, customer_details, call_to_action = process_audio_from_cos(file_key)
+            if errors:
+                return jsonify({"error": errors[0], "status": "failed"}), 400
+            try:
+                insight_summary, sentiment = insights
+            except (TypeError, ValueError):
+                insight_summary = "Error: Could not extract summary"
+                sentiment = "Error: Could not extract sentiment"
 
-        duration_seconds = parse_call_duration(json_data.get('CallDuration', '00:00:00'))
-        if duration_seconds <= 15:
-            response = {
-                "monitorUCID": monitor_ucid,
-                "UUI": uui,
-                "customer_details": {},
-                "call_transcription": {"separated_transcript": "Call is less than 15 sec"},
-                "call_to_action": FORCED_CALL_TO_ACTION_ITEMS.copy(),
-                "call_rating": {"rating": "Unknown", "reasons": ["Call could not be analyzed."]}
-            }
-            # ── First: Enrich with Lead / Opportunity from Presto ──
-            response = enrich_response_with_lead_opportunity(response, json_data)
-            # ── Then: Normalize to Salesforce field names ──────────
-            response = normalize_salesforce_payload(response)
-            return jsonify(response), 200
+        opportunity_id, lead_id = _extract_salesforce_link_ids(json_data)
 
-        errors, separated, insights, callquality, transcript, customer_details, call_to_action = process_audio_from_cos(file_key)
-        if errors:
-            return jsonify({"error": errors[0], "status": "failed"}), 400
+        # Parse call quality for rating and reasons
+        rating_data = parse_call_quality(callquality_val)
+        rating_value = rating_data.get("rating", "Unknown")
+        reasons = ensure_list(rating_data.get("reasons", []), [])
 
-        insight_summary, sentiment = insights
-        rating_data    = parse_call_quality(callquality)
-        action_items   = clean_call_to_action_items(call_to_action)
-        request_points = build_request_points(callquality, action_items)
+        # Build call_to_action
+        final_call_to_action = build_request_points(callquality_val, call_to_action)
 
+        # Build the response in the requested structure
         response = {
             "monitorUCID": monitor_ucid,
-            "UUI": uui,
-            "customer_details": customer_details or {},
             "call_transcription": {
-                "separated_transcript": format_transcript_for_storage(
-                    separated if separated else (transcript if transcript else "No transcription available")
-                )
+                "separated_transcript": separated
             },
-            "call_insight":            {"summary": insight_summary},
-            "call_to_action":          request_points,
-            "call_rating":             {"rating": rating_data["rating"], "reasons": rating_data["reasons"]},
-            "call_sentiment_analysis": {"sentiment": sentiment}
+            "call_insight": {
+                "summary": insight_summary
+            },
+            "call_to_action": final_call_to_action,
+            "call_Rating": {
+                "rating": rating_value,
+                "reasons": reasons
+            },
+            "call_sentiment_analysis": {
+                "sentiment": sentiment
+            }
         }
 
-        # ── First: Enrich with Lead / Opportunity from Presto ──
-        response = enrich_response_with_lead_opportunity(response, json_data)
-        # ── Then: Normalize to Salesforce field names ──────────
-        response = normalize_salesforce_payload(response)
+        # Add Opportunity__c if available
+        if opportunity_id:
+            response["Opportunity__c"] = opportunity_id
+        if lead_id:
+            response["Lead__c"] = lead_id
 
-        logger.info(f"[API_PROCESS] Final response keys: {list(response.keys())}")
+        logger.info(f"[API_PROCESS] Final response structured as requested")
         return jsonify(response), 200
 
     except Exception as e:
@@ -3974,13 +5188,22 @@ def push_to_salesforce_route():
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
+        if not (isinstance(data.get('opportunity'), dict) or isinstance(data.get('lead'), dict)):
+            json_data = get_json_from_cos(COS_BUCKET, file_key)
+            data = enrich_response_with_lead_opportunity(data, json_data)
+
         push_status = push_to_salesforce(data, file_key)
         messages = {
             'pushed':          ("Successfully pushed data to Salesforce.", "success"),
             'short_duration':  ("This call is 15 seconds or shorter; not pushed.", "info"),
+            'missing_audio_url':("No audio URL available; not pushed.", "info"),
             'already_pushed':  ("Already pushed to Salesforce. Duplicate skipped.", "info"),
             'push_in_progress':("Push already in progress. Duplicate skipped.", "warning"),
             'out_of_range':    ("File is outside the allowed date window; not pushed.", "warning"),
+            'apex_limit_error':("Salesforce error: Apex hit a 'Too many query rows' limit "
+                                 "(CreateCallTranscriptFromJsonAPI). This is a Salesforce-side "
+                                 "issue unrelated to this file's data — please contact your "
+                                 "Salesforce admin to fix the Apex class.", "danger"),
         }
         msg, category = messages.get(push_status, ("Failed to push to Salesforce. Check logs.", "danger"))
         flash(msg, category)
@@ -3999,6 +5222,8 @@ def status():
         completion_message = ""
         if BATCH_PROCESSING_COMPLETED and total_files > 0 and current_batch_start >= total_files:
             completion_message = f"✓ All batch processing completed! {len(pushed_files)} files pushed."
+        elif BATCH_PUSH_LIMIT_REACHED:
+            completion_message = f"Batch stopped automatically after {BATCH_PUSH_LIMIT} successful pushes."
         return jsonify({
             "status":               "success",
             "processed":            len(processed_files),
@@ -4010,6 +5235,8 @@ def status():
             "is_canceling":         CANCEL_PROCESSING,
             "state_file_exists":    os.path.exists(STATE_FILE),
             "batch_completed":      BATCH_PROCESSING_COMPLETED and total_files > 0 and current_batch_start >= total_files,
+            "push_limit_reached":   BATCH_PUSH_LIMIT_REACHED,
+            "batch_push_limit":     BATCH_PUSH_LIMIT,
             "completion_message":   completion_message,
             "push_statistics": {
                 "total_push_attempts": push_stats_snapshot['total_push_attempts'],
